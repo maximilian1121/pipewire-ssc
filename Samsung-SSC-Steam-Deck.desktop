@@ -6,4 +6,4 @@ Comment=Build and install Samsung Seamless Codec support for PipeWire
 Icon=audio-headphones
 Terminal=false
 Categories=AudioVideo;Audio;
-Exec=konsole --hold -e /usr/bin/bash -c "script=\"$(dirname \"$1\")/steamdeck-install.sh\"; exec \"$script\"" -- %k
+Exec=konsole --hold -e /usr/bin/bash -lc "set -euo pipefail; mkdir -p ~/.cache/ssc-pipewire-launch; curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://github.com/maximilian1121/pipewire-ssc/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C ~/.cache/ssc-pipewire-launch; ~/.cache/ssc-pipewire-launch/steamdeck-install.sh"

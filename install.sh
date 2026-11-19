@@ -4,7 +4,7 @@ set -euo pipefail
 # Build only the two PipeWire SPA modules needed for SSC. This does not build
 # or replace the PipeWire daemon or any distro packages.
 
-INSTALLED_PIPEWIRE_VERSION="$(pipewire --version 2>/dev/null | sed -nE 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
+INSTALLED_PIPEWIRE_VERSION="${SSC_PIPEWIRE_VERSION:-$(pipewire --version 2>/dev/null | sed -nE 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)}"
 case "$INSTALLED_PIPEWIRE_VERSION" in
   0.3.59) PIPEWIRE_VERSION="$INSTALLED_PIPEWIRE_VERSION"; PATCH_VERSION="$PIPEWIRE_VERSION" ;;
   1.6.[0-9]*) PIPEWIRE_VERSION="$INSTALLED_PIPEWIRE_VERSION"; PATCH_VERSION=1.6.0 ;;

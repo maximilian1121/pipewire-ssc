@@ -19,6 +19,8 @@ WirePlumber find the modules, then restarts those services to load them.
 | Earbuds | Samsung Galaxy Buds4 Pro |
 | Negotiated codec | SSC (`api.bluez5.codec = "ssc"`) |
 | Negotiated format | `s24-32le`, stereo, 96 kHz (SSC UHQ) |
+| Steam Deck build/install | SteamOS + PipeWire 1.6.8; user-local module install succeeded |
+| Steam Deck Bluetooth negotiation | Not checked; no SSC-capable headset was connected during installation |
 
 The SSC encoder comes from the public [samsung-ssc-encoder project](https://github.com/WillyBilly06/samsung-ssc-encoder).
 The PipeWire integration patch vendors the encoder sources and preserves their
@@ -38,8 +40,8 @@ sudo apt install build-essential git meson ninja-build pkg-config \
 Clone this repository and install the modules as your regular user:
 
 ```sh
-git clone https://github.com/OWNER/ssc-pipewire.git
-cd ssc-pipewire
+git clone https://github.com/maximilian1121/pipewire-ssc.git
+cd pipewire-ssc
 ./install.sh
 ```
 
@@ -50,24 +52,21 @@ the installer with `sudo`.
 
 ## Steam Deck
 
-In Desktop Mode, download the repository files together (or clone the repo),
-then double-click `Samsung-SSC-Steam-Deck.desktop` and choose **Execute**. Keep
-the `.desktop` file beside `steamdeck-install.sh` and the rest of the repo.
-The launcher opens Konsole, checks SteamOS and PipeWire, then runs the
-user-local installer. It does not make the OS image writable or install system
-packages.
+In Desktop Mode, download only `Samsung-SSC-Steam-Deck.desktop` from the
+GitHub repository, right-click it, choose **Properties**, allow it to run as a
+program, then double-click and choose **Execute**. It opens Konsole, downloads
+the current project files from GitHub, checks SteamOS and PipeWire, and runs
+the user-local installer.
 
-Steam Deck support is still experimental. The launcher currently proceeds only
-when PipeWire reports 0.3.59 or 1.6.x and the required build tools and
-development libraries already exist. The 1.6.x patch was exercised on 1.6.0;
-same-series compatibility on the Deck's 1.6.8 is expected but has not yet been
-verified there. SteamOS does not normally include a full
-development toolchain, so this may stop with a dependency message. Installing
-packages with `pacman` requires disabling SteamOS read-only mode, and [Valve
-notes that changes made outside Flatpak may be removed by a SteamOS
-update](https://help.steampowered.com/en/faqs/view/671A-4453-E8D2-323C).
-The 0.3.59 codec patch has not yet been tested on physical Deck hardware; this
-launcher does not claim a guaranteed working install.
+Steam Deck support is experimental. The launcher supports PipeWire 0.3.59 and
+1.6.x. If host build tools are missing, it creates a user-owned Arch Distrobox
+and installs build dependencies inside it. On one Steam Deck running PipeWire
+1.6.8, the 1.6.0 patch applied, both modules built, and the user service
+overrides installed and restarted successfully. Bluetooth negotiation still
+needs testing with a paired SSC-capable headset. The launcher does not make the
+SteamOS image writable or install packages on the host. It downloads project
+files into `~/.cache/ssc-pipewire-launch` and leaves the build container and
+cache in place for later runs.
 
 Connect your earbuds. SSC should be available as the A2DP profile named
 **Samsung Seamless Codec**. To select it from a terminal, use the card name
@@ -103,10 +102,11 @@ overrides, then restarts both services. It does not remove build files in
 
 PipeWire's BlueZ codec interface is private and changes between releases, so
 the project carries separate source patches. The 1.6.0 path is confirmed on the
-KDE neon setup listed above. The 0.3.59 patch is included for older systems
-such as SteamOS, but has not been tested on a Steam Deck; SteamOS compatibility
-also depends on its installed PipeWire version matching a supported release.
-Other PipeWire versions currently stop with a clear unsupported-version error.
+KDE neon setup listed above, and the same patch built and installed against
+PipeWire 1.6.8 on the tested Steam Deck. SSC negotiation on the Deck remains
+unverified. The 0.3.59 patch is included for older systems but has not been
+tested on hardware. Other PipeWire versions currently stop with a clear
+unsupported-version error.
 The installer supports systemd user services; other service managers and
 distributions still need packaging work.
 
