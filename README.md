@@ -8,19 +8,15 @@ into a user-local directory. It does not replace the PipeWire daemon or any
 distro package. The installer adds a user-service override so PipeWire and
 WirePlumber find the modules, then restarts those services to load them.
 
-## Tested
+## Verified setups
 
-| Component | Tested version / result |
-| --- | --- |
-| Linux distribution | KDE neon (Ubuntu 24.04 base) |
-| PipeWire | 1.6.0 |
-| WirePlumber | 0.5.10 |
-| BlueZ | 5.72 |
-| Earbuds | Samsung Galaxy Buds4 Pro |
-| Negotiated codec | SSC (`api.bluez5.codec = "ssc"`) |
-| Negotiated format | `s24-32le`, stereo, 96 kHz (SSC UHQ) |
-| Steam Deck build/install | SteamOS + PipeWire 1.6.8; user-local module install succeeded |
-| Steam Deck Bluetooth negotiation | Galaxy Buds4 Pro, SSC (`api.bluez5.codec = "ssc"`), `s24-32le`, stereo, 96 kHz |
+| System | PipeWire | Bluetooth device | Verified result |
+| --- | --- | --- | --- |
+| KDE neon (Ubuntu 24.04 base) | 1.6.0 | Galaxy Buds4 Pro | SSC UHQ, 24-bit, stereo, 96 kHz |
+| Steam Deck (SteamOS) | 1.6.8 | Galaxy Buds4 Pro | SSC UHQ, 24-bit, stereo, 96 kHz |
+
+On both systems, PipeWire reported `api.bluez5.codec = "ssc"` and the sink
+format `s24-32le 2ch 96000Hz`. KDE neon used WirePlumber 0.5.10 and BlueZ 5.72.
 
 The SSC encoder comes from the public [samsung-ssc-encoder project](https://github.com/WillyBilly06/samsung-ssc-encoder).
 The PipeWire integration patch vendors the encoder sources and preserves their
