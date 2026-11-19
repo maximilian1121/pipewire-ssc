@@ -1,0 +1,3635 @@
+diff --git a/spa/include/spa/param/bluetooth/audio.h b/spa/include/spa/param/bluetooth/audio.h
+index 34b45e2..973f407 100644
+--- a/spa/include/spa/param/bluetooth/audio.h
++++ b/spa/include/spa/param/bluetooth/audio.h
+@@ -36,6 +36,7 @@ enum spa_bluetooth_audio_codec {
+ 	SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX,
+ 	SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO,
+ 	SPA_BLUETOOTH_AUDIO_CODEC_OPUS_G,
++	SPA_BLUETOOTH_AUDIO_CODEC_SSC,
+ 
+ 	/* HFP */
+ 	SPA_BLUETOOTH_AUDIO_CODEC_CVSD = 0x100,
+diff --git a/spa/include/spa/param/bluetooth/type-info.h b/spa/include/spa/param/bluetooth/type-info.h
+index 7bf1da5..08c61af 100644
+--- a/spa/include/spa/param/bluetooth/type-info.h
++++ b/spa/include/spa/param/bluetooth/type-info.h
+@@ -40,6 +40,7 @@ static const struct spa_type_info spa_type_bluetooth_audio_codec[] = {
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "opus_05_duplex", NULL },
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "opus_05_pro", NULL },
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_OPUS_G, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "opus_g", NULL },
++	{ SPA_BLUETOOTH_AUDIO_CODEC_SSC, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "ssc", NULL },
+ 
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_CVSD, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "cvsd", NULL },
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_MSBC, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "msbc", NULL },
+diff --git a/spa/plugins/bluez5/a2dp-codec-ssc.c b/spa/plugins/bluez5/a2dp-codec-ssc.c
+new file mode 100644
+index 0000000..20a741a
+--- /dev/null
++++ b/spa/plugins/bluez5/a2dp-codec-ssc.c
+@@ -0,0 +1,244 @@
++/* Samsung Scalable / Seamless Codec A2DP source plugin.
++ * SPDX-License-Identifier: MIT
++ * Encoder implementation: samsung-ssc-encoder, BSD-3-Clause.
++ */
++
++#include <errno.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <arpa/inet.h>
++
++#include <spa/param/audio/format.h>
++#include <spa/param/audio/format-utils.h>
++#include <spa/utils/string.h>
++
++#include "rtp.h"
++#include "media-codecs.h"
++#include "ssc_encoder.h"
++
++#define SSC_VENDOR_ID 0x00000075u
++#define SSC_CODEC_ID  0x0103u
++#define SSC_CAPS_ALL  0x3eu
++#define SSC_FLAG_44K1 0x20u
++#define SSC_FLAG_48K   0x10u
++#define SSC_FLAG_HIFI  0x04u
++#define SSC_FLAG_UHQ   0x02u
++
++typedef struct __attribute__((packed)) {
++	a2dp_vendor_codec_t info;
++	uint8_t flags;
++} a2dp_ssc_t;
++
++struct impl {
++	ssc_encoder *encoder;
++	struct rtp_header *header;
++	uint8_t flags;
++	uint32_t rate;
++	uint32_t bits;
++	uint32_t bitrate;
++	int block_size;
++	uint64_t interval;
++};
++
++static int codec_fill_caps(const struct media_codec *codec, uint32_t flags,
++		const struct spa_dict *settings, uint8_t caps[A2DP_MAX_CAPS_SIZE])
++{
++	a2dp_ssc_t conf = { .info = { SSC_VENDOR_ID, SSC_CODEC_ID }, .flags = SSC_CAPS_ALL };
++	memcpy(caps, &conf, sizeof(conf));
++	return sizeof(conf);
++}
++
++static int codec_select_config(const struct media_codec *codec, uint32_t flags,
++		const void *caps, size_t caps_size,
++		const struct media_codec_audio_info *audio,
++		const struct spa_dict *settings, uint8_t config[A2DP_MAX_CAPS_SIZE],
++		void **config_data)
++{
++	a2dp_ssc_t conf;
++	const a2dp_ssc_t *peer = caps;
++	if (caps == NULL || caps_size < sizeof(conf) ||
++	    peer->info.vendor_id != SSC_VENDOR_ID || peer->info.codec_id != SSC_CODEC_ID)
++		return -EINVAL;
++
++	/* Prefer 96 kHz UHQ when the sink advertises it, then 48 kHz HiFi.
++	 * Keep SSC 16-bit modes available for sinks without the newer modes. */
++	conf.info = peer->info;
++	if ((peer->flags & SSC_FLAG_UHQ) && !(peer->flags & 0x01))
++		conf.flags = SSC_FLAG_UHQ | (peer->flags & 0x08);
++	else if (peer->flags & SSC_FLAG_HIFI)
++		conf.flags = SSC_FLAG_HIFI | (peer->flags & 0x08);
++	else if (peer->flags & SSC_FLAG_48K)
++		conf.flags = SSC_FLAG_48K | (peer->flags & 0x08);
++	else if (peer->flags & SSC_FLAG_44K1)
++		conf.flags = SSC_FLAG_44K1 | (peer->flags & 0x08);
++	else
++		return -ENOTSUP;
++	memcpy(config, &conf, sizeof(conf));
++	return sizeof(conf);
++}
++
++static int codec_validate_config(const struct media_codec *codec, uint32_t flags,
++		const void *caps, size_t caps_size, struct spa_audio_info *info)
++{
++	const a2dp_ssc_t *conf = caps;
++	if (!conf || caps_size < sizeof(*conf) || conf->info.vendor_id != SSC_VENDOR_ID ||
++	    conf->info.codec_id != SSC_CODEC_ID)
++		return -EINVAL;
++	spa_zero(*info);
++	info->media_type = SPA_MEDIA_TYPE_audio;
++	info->media_subtype = SPA_MEDIA_SUBTYPE_raw;
++	info->info.raw.channels = 2;
++	info->info.raw.position[0] = SPA_AUDIO_CHANNEL_FL;
++	info->info.raw.position[1] = SPA_AUDIO_CHANNEL_FR;
++	if (conf->flags & SSC_FLAG_UHQ) {
++		info->info.raw.rate = 96000;
++		info->info.raw.format = SPA_AUDIO_FORMAT_S24_32_LE;
++	} else if (conf->flags & SSC_FLAG_HIFI) {
++		info->info.raw.rate = 48000;
++		info->info.raw.format = SPA_AUDIO_FORMAT_S24_32_LE;
++	} else if (conf->flags == SSC_FLAG_44K1 || conf->flags == (SSC_FLAG_44K1 | 0x08)) {
++		info->info.raw.rate = 44100;
++		info->info.raw.format = SPA_AUDIO_FORMAT_S16_LE;
++	} else if (conf->flags == SSC_FLAG_48K || conf->flags == (SSC_FLAG_48K | 0x08)) {
++		info->info.raw.rate = 48000;
++		info->info.raw.format = SPA_AUDIO_FORMAT_S16_LE;
++	} else {
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int codec_enum_config(const struct media_codec *codec, uint32_t flags,
++		const void *caps, size_t caps_size, uint32_t id, uint32_t idx,
++		struct spa_pod_builder *b, struct spa_pod **param)
++{
++	struct spa_audio_info info;
++	struct spa_pod_frame f;
++	int res = codec_validate_config(codec, flags, caps, caps_size, &info);
++	if (res < 0 || idx > 0)
++		return res < 0 ? res : 0;
++	spa_pod_builder_push_object(b, &f, SPA_TYPE_OBJECT_Format, id);
++	spa_pod_builder_add(b,
++		SPA_FORMAT_mediaType, SPA_POD_Id(info.media_type),
++		SPA_FORMAT_mediaSubtype, SPA_POD_Id(info.media_subtype),
++		SPA_FORMAT_AUDIO_format, SPA_POD_Id(info.info.raw.format),
++		SPA_FORMAT_AUDIO_rate, SPA_POD_Int(info.info.raw.rate),
++		SPA_FORMAT_AUDIO_channels, SPA_POD_Int(info.info.raw.channels),
++		SPA_FORMAT_AUDIO_position, SPA_POD_Array(sizeof(uint32_t), SPA_TYPE_Id,
++			info.info.raw.channels, info.info.raw.position), 0);
++	*param = spa_pod_builder_pop(b, &f);
++	return *param ? 1 : -EIO;
++}
++
++static uint32_t choose_bitrate(uint32_t rate, size_t mtu)
++{
++	if (rate == 96000)
++		return mtu >= 700 ? 584000 : 291000;
++	return 192000;
++}
++
++static void *codec_init(const struct media_codec *codec, uint32_t flags,
++		void *config, size_t config_size, const struct spa_audio_info *info,
++		void *props, size_t mtu)
++{
++	struct impl *this;
++	const a2dp_ssc_t *conf = config;
++	this = calloc(1, sizeof(*this));
++	if (!this)
++		return NULL;
++	if (!conf || config_size < sizeof(*conf) || info->media_type != SPA_MEDIA_TYPE_audio ||
++	    info->media_subtype != SPA_MEDIA_SUBTYPE_raw || info->info.raw.channels != 2)
++		goto error;
++	this->flags = conf->flags;
++	this->rate = info->info.raw.rate;
++	this->bits = (info->info.raw.format == SPA_AUDIO_FORMAT_S16_LE) ? 16 : 24;
++	if ((this->bits == 16 && info->info.raw.format != SPA_AUDIO_FORMAT_S16_LE) ||
++	    (this->bits == 24 && info->info.raw.format != SPA_AUDIO_FORMAT_S24_32_LE))
++		goto error;
++	this->bitrate = choose_bitrate(this->rate, mtu);
++	if (this->rate != 96000 && !(this->flags & 0x08))
++		this->bitrate = 128000;
++	this->encoder = ssc_encoder_create(this->rate);
++	if (!this->encoder)
++		goto error;
++	this->block_size = 864 * 2 * (this->bits == 16 ? 2 : 4);
++	this->interval = (uint64_t)864 * SPA_NSEC_PER_SEC / this->rate;
++	return this;
++error:
++	ssc_encoder_destroy(this->encoder);
++	free(this);
++	return NULL;
++}
++
++static void codec_deinit(void *data)
++{
++	struct impl *this = data;
++	ssc_encoder_destroy(this->encoder);
++	free(this);
++}
++
++static int codec_get_block_size(void *data) { return ((struct impl *)data)->block_size; }
++static uint64_t codec_get_interval(void *data) { return ((struct impl *)data)->interval; }
++
++static int codec_start_encode(void *data, void *dst, size_t dst_size,
++		uint16_t seqnum, uint32_t timestamp)
++{
++	struct impl *this = data;
++	if (dst_size < sizeof(struct rtp_header))
++		return -ENOSPC;
++	this->header = dst;
++	this->header->v = 2;
++	this->header->pt = 96;
++	this->header->sequence_number = htons(seqnum);
++	this->header->timestamp = htonl(timestamp);
++	this->header->ssrc = htonl(1);
++	return sizeof(struct rtp_header);
++}
++
++static int codec_encode(void *data, const void *src, size_t src_size,
++		void *dst, size_t dst_size, size_t *dst_out, int *need_flush)
++{
++	struct impl *this = data;
++	int res;
++	if (!src || src_size < (size_t)this->block_size)
++		return -EINVAL;
++	if (this->bits == 16)
++		res = ssc_encode(this->encoder, src, this->bitrate, 0, dst, dst_size);
++	else
++		res = ssc_encode_s32(this->encoder, src, 24, this->bitrate, 0, dst, dst_size);
++	if (res < 0)
++		return res;
++	*dst_out = (size_t)res;
++	*need_flush = NEED_FLUSH_ALL;
++	return this->block_size;
++}
++
++static void codec_get_delay(void *data, uint32_t *encoder, uint32_t *decoder)
++{
++	if (encoder) *encoder = 108;
++	if (decoder) *decoder = 0;
++}
++
++static const struct media_codec a2dp_codec_ssc = {
++	.id = SPA_BLUETOOTH_AUDIO_CODEC_SSC,
++	.kind = MEDIA_CODEC_A2DP,
++	.codec_id = A2DP_CODEC_VENDOR,
++	.vendor = { .vendor_id = SSC_VENDOR_ID, .codec_id = SSC_CODEC_ID },
++	.name = "ssc",
++	.description = "Samsung Seamless Codec",
++	.fill_caps = codec_fill_caps,
++	.select_config = codec_select_config,
++	.enum_config = codec_enum_config,
++	.validate_config = codec_validate_config,
++	.init = codec_init,
++	.deinit = codec_deinit,
++	.get_block_size = codec_get_block_size,
++	.get_interval = codec_get_interval,
++	.start_encode = codec_start_encode,
++	.encode = codec_encode,
++	.get_delay = codec_get_delay,
++};
++
++MEDIA_CODEC_EXPORT_DEF("ssc", &a2dp_codec_ssc);
+diff --git a/spa/plugins/bluez5/codec-loader.c b/spa/plugins/bluez5/codec-loader.c
+index 68e6af7..0db2586 100644
+--- a/spa/plugins/bluez5/codec-loader.c
++++ b/spa/plugins/bluez5/codec-loader.c
+@@ -31,6 +31,7 @@ struct impl {
+ static int codec_order(const struct media_codec *c)
+ {
+ 	static const enum spa_bluetooth_audio_codec order[] = {
++		SPA_BLUETOOTH_AUDIO_CODEC_SSC,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_LC3,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
+@@ -188,6 +189,7 @@ const struct media_codec * const *load_media_codecs(struct spa_plugin_loader *lo
+ 		MEDIA_CODEC_FACTORY_LIB("lc3plus"),
+ 		MEDIA_CODEC_FACTORY_LIB("opus"),
+ 		MEDIA_CODEC_FACTORY_LIB("opus-g"),
++		MEDIA_CODEC_FACTORY_LIB("ssc"),
+ 		MEDIA_CODEC_FACTORY_LIB("lc3"),
+ 		MEDIA_CODEC_FACTORY_LIB("g722"),
+ 		MEDIA_CODEC_FACTORY_LIB("hfp-cvsd"),
+diff --git a/spa/plugins/bluez5/meson.build b/spa/plugins/bluez5/meson.build
+index 01c5f3a..45fa729 100644
+--- a/spa/plugins/bluez5/meson.build
++++ b/spa/plugins/bluez5/meson.build
+@@ -90,6 +90,31 @@ bluez_codec_sbc = shared_library('spa-codec-bluez5-sbc',
+   install : true,
+   install_dir : spa_plugindir / 'bluez5')
+ 
++# Samsung SSC encoder is clean-room BSD-3-Clause code vendored under
++# spa/plugins/bluez5/ssc-encoder. Keep it isolated in this codec module.
++ssc_encoder_lib = static_library('ssc-encoder',
++  [ 'ssc-encoder/src/ssc_encoder.c',
++    'ssc-encoder/src/ssc_enc_analysis.c',
++    'ssc-encoder/src/ssc_enc_alloc.c',
++    'ssc-encoder/src/ssc_enc_bands.c',
++    'ssc-encoder/src/ssc_enc_ec.c',
++    'ssc-encoder/src/ssc_enc_energy.c',
++    'ssc-encoder/src/ssc_enc_mdct.c',
++    'ssc-encoder/src/ssc_enc_pitch.c',
++    'ssc-encoder/src/ssc_enc_tables.c' ],
++  include_directories : include_directories('ssc-encoder/include', 'ssc-encoder/src'),
++  dependencies : [ mathlib ],
++  pic : true)
++
++bluez_codec_ssc = shared_library('spa-codec-bluez5-ssc',
++  [ 'a2dp-codec-ssc.c', 'media-codecs.c' ],
++  include_directories : [ configinc, include_directories('ssc-encoder/include') ],
++  c_args : codec_args,
++  link_with : ssc_encoder_lib,
++  dependencies : [ spa_dep, mathlib ],
++  install : true,
++  install_dir : spa_plugindir / 'bluez5')
++
+ bluez_codec_faststream = shared_library('spa-codec-bluez5-faststream',
+   [ 'a2dp-codec-faststream.c', 'media-codecs.c' ],
+   include_directories : [ configinc ],
+diff --git a/spa/plugins/bluez5/ssc-encoder/LICENSE b/spa/plugins/bluez5/ssc-encoder/LICENSE
+new file mode 100644
+index 0000000..655769d
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/LICENSE
+@@ -0,0 +1,81 @@
++BSD 3-Clause License
++
++Copyright (c) 2026, William Ho
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this
++   list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++3. Neither the name of the copyright holder nor the names of its
++   contributors may be used to endorse or promote products derived from
++   this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++-------------------------------------------------------------------------------
++
++Parts of this software (the range coder, energy quantisation, bit allocation,
++PVQ band coding, pitch analysis and encoder analysis functions, and the
++decoder copy in tests/decoder) are adapted from the CELT layer of libopus 1.1,
++which is distributed under the following license:
++
++Copyright 2001-2011 Xiph.Org, Skype Limited, Octasic,
++                    Jean-Marc Valin, Timothy B. Terriberry,
++                    CSIRO, Gregory Maxwell, Mark Borgerding,
++                    Erik de Castro Lopo
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions
++are met:
++
++- Redistributions of source code must retain the above copyright
++notice, this list of conditions and the following disclaimer.
++
++- Redistributions in binary form must reproduce the above copyright
++notice, this list of conditions and the following disclaimer in the
++documentation and/or other materials provided with the distribution.
++
++- Neither the name of Internet Society, IETF or IETF Trust, nor the
++names of specific contributors, may be used to endorse or promote
++products derived from this software without specific prior written
++permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
++OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++Opus is subject to the royalty-free patent licenses which are
++specified at:
++
++Xiph.Org Foundation:
++https://datatracker.ietf.org/ipr/1524/
++
++Microsoft Corporation:
++https://datatracker.ietf.org/ipr/1914/
++
++Broadcom Corporation:
++https://datatracker.ietf.org/ipr/1526/
+diff --git a/spa/plugins/bluez5/ssc-encoder/include/ssc_encoder.h b/spa/plugins/bluez5/ssc-encoder/include/ssc_encoder.h
+new file mode 100644
+index 0000000..54472c4
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/include/ssc_encoder.h
+@@ -0,0 +1,107 @@
++/* Open-source encoder for the Samsung Scalable Codec / Samsung Seamless Codec (SSC), the Bluetooth A2DP
++ * vendor codec (vendor 0x00000075, codec 0x0103) used by Galaxy phones and Galaxy Buds.
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ *
++ * One SSC frame carries 864 stereo samples: a 4-byte header (FF Ex, sequence, bitrate code) followed by a
++ * range-coded CELT-style payload. The frame size is fixed by the bitrate and the codec mode; see
++ * ssc_encoder_frame_bytes(). There is no length field on the wire, so a receiver derives it from the header.
++ *
++ * Codec modes: 44100 and 48000 Hz share one mode (the sample rate is not signalled), 96000 Hz has its own.
++ * Bitrates (bits per second, or the header rate code):
++ *   F-family: 88000 (0xF0), 96000 (0xF1), 128000 (0xF2), 192000 (0xF3), 229000 (0xF4), 328000 (0xF5),
++ *             256000 (0xF6)
++ *   E-family: 291000 (0xE0), 308000 (0xE1), 442000 (0xE2), 584000 (0xE3), 886000 (0xE4), 250000 (0xE5),
++ *             152000 (0xE6)
++ * The encoder is not thread-safe per instance; separate instances are independent. No static state. */
++#ifndef SSC_ENCODER_H
++#define SSC_ENCODER_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define SSC_ENC_FRAME_SAMPLES 864  /* samples per channel per frame */
++#define SSC_ENC_MAX_FRAME_BYTES 2172 /* largest frame: 886 kb/s in the 44.1/48 kHz mode */
++
++/* Error codes (negative return values). */
++#define SSC_ENC_ERR_ARG     -1 /* bad argument */
++#define SSC_ENC_ERR_BITRATE -2 /* unsupported bitrate */
++#define SSC_ENC_ERR_BUFFER  -3 /* output buffer too small */
++#define SSC_ENC_ERR_INTERNAL -4
++
++/* Flags for ssc_encode*(). */
++/* Reproduce the level of Samsung's encoder for 16-bit input at the "hq" rates (250k, 256k, 291k, 308k,
++ * 328k, 442k, 584k, 886k): it scales such input as if it were 24-bit, so the coded signal is 48 dB quieter
++ * and the end-band side information differs. Only useful to compare against Samsung's output. */
++#define SSC_ENC_FLAG_SAMSUNG_HQ16_LEVEL 0x1u
++/* Disable the transient detector (always long blocks). */
++#define SSC_ENC_FLAG_NO_TRANSIENTS 0x2u
++/* Disable the pitch prefilter (the frame then signals "postfilter off"). */
++#define SSC_ENC_FLAG_NO_POSTFILTER 0x4u
++/* Do not apply Samsung's fixed high-frequency shaping (up to -1.7 dB above ~6-16 kHz, depending on the rate).
++ * The default applies it, like Samsung's encoder; it slightly lowers the waveform error of the noise-filled
++ * top bands. The header side information is computed the same way either way. */
++#define SSC_ENC_FLAG_FLAT_RESPONSE 0x8u
++
++typedef struct ssc_encoder ssc_encoder;
++
++/* Per-frame information about the last encoded frame. */
++typedef struct {
++    int bytes;          /* total frame size, header included */
++    int bitrate;        /* bits per second */
++    int hq;             /* "hq" rate class (E-family, 256k, 328k): no TF symbols, 24-bit scale */
++    int seq;            /* sequence number written into the header (0..255) */
++    int end_band;       /* number of coded bands (18..22) */
++    int transient;      /* short blocks used */
++    int pf_on;          /* pitch postfilter enabled */
++    int pf_period;      /* postfilter period in samples (15..1022), if pf_on */
++    int pf_gain_q;      /* postfilter gain index 0..7 (gain = 0.09375 * (q + 1)), if pf_on */
++    int silence;        /* silence frame */
++    int coded_bands;    /* bands that received PVQ bits */
++    int tell_bits;      /* final range-coder position in bits (ec_tell before ec_enc_done) */
++    int total_bits;     /* bit budget 8 * min(payload, 1275) */
++} ssc_encoder_frame_info;
++
++typedef void *(*ssc_enc_alloc_fn)(void *ctx, unsigned size);
++typedef void (*ssc_enc_free_fn)(void *ctx, void *ptr);
++
++/* sample_rate: 44100, 48000 or 96000. Returns NULL on a bad rate or out of memory. */
++ssc_encoder *ssc_encoder_create(int sample_rate);
++ssc_encoder *ssc_encoder_create_with_allocator(int sample_rate, ssc_enc_alloc_fn alloc, ssc_enc_free_fn release,
++                                               void *ctx);
++void ssc_encoder_destroy(ssc_encoder *enc);
++/* Clears all history and restarts the sequence counter at 0. */
++void ssc_encoder_reset(ssc_encoder *enc);
++/* Bytes allocated by one encoder instance. */
++int ssc_encoder_size(void);
++
++/* Frame size in bytes (header included) for a bitrate (bps or rate code) in a codec mode
++ * (sample_rate 44100/48000 or 96000). Returns 0 for an unsupported bitrate. */
++int ssc_encoder_frame_bytes(int sample_rate, int bitrate);
++/* Normalises a bitrate given as bps or as a rate code (0xF0..0xF6, 0xE0..0xE6) to bps; 0 if unsupported. */
++int ssc_encoder_bitrate(int bitrate_or_code);
++
++/* Encodes one frame of 864 interleaved stereo int16 samples (L R L R ...).
++ * bitrate: bps or rate code; it may change from frame to frame. flags: SSC_ENC_FLAG_*.
++ * Returns the number of bytes written to out (the full frame), or a negative error code. */
++int ssc_encode(ssc_encoder *enc, const int16_t *pcm, int bitrate, unsigned flags, uint8_t *out, int max_bytes);
++
++/* Same, for wider samples: interleaved stereo int32, right-justified with bits_per_sample significant bits
++ * (16..32; 24 for HiFi / UHQ input, i.e. full scale +-2^23). */
++int ssc_encode_s32(ssc_encoder *enc, const int32_t *pcm, int bits_per_sample, int bitrate, unsigned flags,
++                   uint8_t *out, int max_bytes);
++
++/* Same, float samples in [-1, 1). */
++int ssc_encode_float(ssc_encoder *enc, const float *pcm, int bitrate, unsigned flags, uint8_t *out,
++                     int max_bytes);
++
++/* Details of the last frame (returns 0, or -1 if no frame was encoded yet). */
++int ssc_encoder_last_frame_info(const ssc_encoder *enc, ssc_encoder_frame_info *info);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_alloc.c b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_alloc.c
+new file mode 100644
+index 0000000..aa81db9
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_alloc.c
+@@ -0,0 +1,216 @@
++/* SSC encoder: bit allocation (encoder side of compute_allocation / interp_bits2pulses).
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ * Adapted from libopus 1.1 celt/rate.c (Copyright 2007-2009 Xiph.Org Foundation, BSD-3-Clause, see LICENSE).
++ *
++ * SSC specifics: C = 2 and LM = 3 always, start = 0, per-band caps from the mode table, and the allocation
++ * vector table is chosen by bitrate (> 192 kb/s uses the second table). Everything here is integer and must
++ * follow the decoder exactly; the only encoder choices are the band-skip flags, the intensity band and the
++ * dual-stereo flag. */
++#include "ssc_enc_internal.h"
++
++#define ALLOC_STEPS 6
++#define FINE_OFFSET 21
++#define NB_VECTORS  11
++
++static int interp_bits2pulses(const sscenc_mode *m, int end, int skip_start, const int *bits1, const int *bits2,
++                              const int *thresh, const int *cap, int32_t total, int32_t *_balance, int skip_rsv,
++                              int *intensity, int intensity_rsv, int *dual_stereo, int dual_stereo_rsv, int *bits,
++                              int *ebits, int *fine_priority, int prev, int signalBandwidth, sscenc_ec *ec) {
++    const int C = SSCE_C, alloc_floor = C << SSCE_BITRES, logM = SSCE_LM << SSCE_BITRES;
++    const short *eBands = m->eBands;
++    int32_t psum, left, percoeff, balance;
++    int lo = 0, hi = 1 << ALLOC_STEPS, i, j, done, codedBands;
++
++    for (i = 0; i < ALLOC_STEPS; i++) {
++        int mid = (lo + hi) >> 1;
++        psum = 0;
++        done = 0;
++        for (j = end; j-- > 0;) {
++            int tmp = bits1[j] + (int)(((int32_t)mid * bits2[j]) >> ALLOC_STEPS);
++            if (tmp >= thresh[j] || done) {
++                done = 1;
++                psum += sscenc_imin(tmp, cap[j]);
++            } else if (tmp >= alloc_floor) {
++                psum += alloc_floor;
++            }
++        }
++        if (psum > total) hi = mid;
++        else lo = mid;
++    }
++    psum = 0;
++    done = 0;
++    for (j = end; j-- > 0;) {
++        int tmp = bits1[j] + (int)(((int32_t)lo * bits2[j]) >> ALLOC_STEPS);
++        if (tmp < thresh[j] && !done) tmp = tmp >= alloc_floor ? alloc_floor : 0;
++        else done = 1;
++        tmp = sscenc_imin(tmp, cap[j]);
++        bits[j] = tmp;
++        psum += tmp;
++    }
++
++    /* Decide which bands to skip, working backwards from the end. */
++    for (codedBands = end;; codedBands--) {
++        int band_width, band_bits, rem;
++        j = codedBands - 1;
++        if (j <= skip_start) {
++            total += skip_rsv; /* give the reserved skip bit back */
++            break;
++        }
++        left = total - psum;
++        percoeff = left / (eBands[codedBands] - eBands[0]);
++        left -= (eBands[codedBands] - eBands[0]) * percoeff;
++        rem = sscenc_imax(left - (eBands[j] - eBands[0]), 0);
++        band_width = eBands[codedBands] - eBands[j];
++        band_bits = (int)(bits[j] + percoeff * band_width + rem);
++        if (band_bits >= sscenc_imax(thresh[j], alloc_floor + (1 << SSCE_BITRES))) {
++            /* The only non-normative part of the allocation: keep the band (hysteresis against the
++             * previous frame's coded band count) or signal a skip. */
++            if (codedBands <= 2 ||
++                (band_bits > ((j < prev ? 7 : 9) * band_width << SSCE_LM << SSCE_BITRES) >> 4 &&
++                 j <= signalBandwidth)) {
++                sscenc_ec_bit_logp(ec, 1, 1);
++                break;
++            }
++            sscenc_ec_bit_logp(ec, 0, 1);
++            psum += 1 << SSCE_BITRES;
++            band_bits -= 1 << SSCE_BITRES;
++        }
++        /* Reclaim the bits originally allocated to this band. */
++        psum -= bits[j] + intensity_rsv;
++        if (intensity_rsv > 0) intensity_rsv = sscenc_log2_frac[j];
++        psum += intensity_rsv;
++        if (band_bits >= alloc_floor) {
++            psum += alloc_floor;
++            bits[j] = alloc_floor;
++        } else {
++            bits[j] = 0;
++        }
++    }
++
++    /* Intensity and dual stereo parameters. */
++    if (intensity_rsv > 0) {
++        *intensity = sscenc_imin(*intensity, codedBands);
++        sscenc_ec_uint(ec, (uint32_t)*intensity, (uint32_t)(codedBands + 1));
++    } else {
++        *intensity = 0;
++    }
++    if (*intensity <= 0) {
++        total += dual_stereo_rsv;
++        dual_stereo_rsv = 0;
++    }
++    if (dual_stereo_rsv > 0) sscenc_ec_bit_logp(ec, *dual_stereo, 1);
++    else *dual_stereo = 0;
++
++    /* Allocate the remaining bits */
++    left = total - psum;
++    percoeff = left / (eBands[codedBands] - eBands[0]);
++    left -= (eBands[codedBands] - eBands[0]) * percoeff;
++    for (j = 0; j < codedBands; j++) bits[j] += (int)(percoeff * (eBands[j + 1] - eBands[j]));
++    for (j = 0; j < codedBands; j++) {
++        int tmp = (int)sscenc_imin(left, eBands[j + 1] - eBands[j]);
++        bits[j] += tmp;
++        left -= tmp;
++    }
++
++    balance = 0;
++    for (j = 0; j < codedBands; j++) {
++        int N0 = eBands[j + 1] - eBands[j], den, offset, NClogN;
++        int32_t excess, bit;
++        bit = (int32_t)bits[j] + balance;
++        excess = bit - cap[j];
++        if (excess < 0) excess = 0;
++        bits[j] = bit - excess;
++        den = C * (N0 << SSCE_LM) + ((!*dual_stereo && j < *intensity) ? 1 : 0);
++        NClogN = den * (m->logN[j] + logM);
++        offset = (NClogN >> 1) - den * FINE_OFFSET;
++        if (bits[j] + offset < den * 2 << SSCE_BITRES) offset += NClogN >> 2;
++        else if (bits[j] + offset < den * 3 << SSCE_BITRES) offset += NClogN >> 3;
++        ebits[j] = sscenc_imax(0, (bits[j] + offset + (den << (SSCE_BITRES - 1))) / (den << SSCE_BITRES));
++        if (C * ebits[j] > (bits[j] >> SSCE_BITRES)) ebits[j] = bits[j] >> 1 >> SSCE_BITRES;
++        ebits[j] = sscenc_imin(ebits[j], SSCE_MAX_FINE);
++        fine_priority[j] = ebits[j] * (den << SSCE_BITRES) >= bits[j] + offset;
++        bits[j] -= C * ebits[j] << SSCE_BITRES;
++        if (excess > 0) {
++            int extra_fine, extra_bits;
++            extra_fine = sscenc_imin((int)(excess >> (1 + SSCE_BITRES)), SSCE_MAX_FINE - ebits[j]);
++            ebits[j] += extra_fine;
++            extra_bits = extra_fine * C << SSCE_BITRES;
++            fine_priority[j] = extra_bits >= excess - balance;
++            excess -= extra_bits;
++        }
++        balance = excess;
++    }
++    *_balance = balance;
++    for (; j < end; j++) {
++        ebits[j] = bits[j] >> 1 >> SSCE_BITRES;
++        bits[j] = 0;
++        fine_priority[j] = ebits[j] < 1;
++    }
++    return codedBands;
++}
++
++int sscenc_compute_allocation(const sscenc_mode *m, int end, const int *offsets, int alloc_trim, int hi_rate,
++                              int32_t total, int32_t *balance, int *pulses, int *ebits, int *fine_priority,
++                              int *intensity, int *dual_stereo, int prev_coded, int signal_bw, sscenc_ec *ec) {
++    const int C = SSCE_C, LM = SSCE_LM, len = SSCE_NB;
++    const unsigned char *av = m->allocVectors[hi_rate ? 1 : 0];
++    const int *cap = m->cap;
++    int lo, hi, j, skip_start = 0, skip_rsv, intensity_rsv, dual_stereo_rsv;
++    int bits1[SSCE_NB], bits2[SSCE_NB], thresh[SSCE_NB], trim_offset[SSCE_NB];
++
++    if (total < 0) total = 0;
++    skip_rsv = total >= 1 << SSCE_BITRES ? 1 << SSCE_BITRES : 0;
++    total -= skip_rsv;
++    intensity_rsv = sscenc_log2_frac[end];
++    dual_stereo_rsv = 0;
++    if (intensity_rsv > total) {
++        intensity_rsv = 0;
++    } else {
++        total -= intensity_rsv;
++        dual_stereo_rsv = total >= 1 << SSCE_BITRES ? 1 << SSCE_BITRES : 0;
++        total -= dual_stereo_rsv;
++    }
++    for (j = 0; j < end; j++) {
++        int N0 = m->eBands[j + 1] - m->eBands[j];
++        thresh[j] = sscenc_imax(C << SSCE_BITRES, (3 * N0 << LM << SSCE_BITRES) >> 4);
++        trim_offset[j] = C * N0 * (alloc_trim - 5 - LM) * (end - j - 1);
++    }
++    lo = 1;
++    hi = NB_VECTORS - 1;
++    do {
++        int done = 0, mid = (lo + hi) >> 1;
++        int32_t psum = 0;
++        for (j = end; j-- > 0;) {
++            int N0 = m->eBands[j + 1] - m->eBands[j];
++            int bitsj = C * N0 * av[mid * len + j] << LM >> 2;
++            if (bitsj > 0) bitsj = sscenc_imax(0, bitsj + trim_offset[j]);
++            bitsj += offsets[j];
++            if (bitsj >= thresh[j] || done) {
++                done = 1;
++                psum += sscenc_imin(bitsj, cap[j]);
++            } else if (bitsj >= C << SSCE_BITRES) {
++                psum += C << SSCE_BITRES;
++            }
++        }
++        if (psum > total) hi = mid - 1;
++        else lo = mid + 1;
++    } while (lo <= hi);
++    hi = lo--;
++    for (j = 0; j < end; j++) {
++        int N0 = m->eBands[j + 1] - m->eBands[j];
++        int bits1j = C * N0 * av[lo * len + j] << LM >> 2;
++        int bits2j = hi >= NB_VECTORS ? cap[j] : C * N0 * av[hi * len + j] << LM >> 2;
++        if (bits1j > 0) bits1j = sscenc_imax(0, bits1j + trim_offset[j]);
++        if (bits2j > 0) bits2j = sscenc_imax(0, bits2j + trim_offset[j]);
++        if (lo > 0) bits1j += offsets[j];
++        bits2j += offsets[j];
++        if (offsets[j] > 0) skip_start = j;
++        bits2j = sscenc_imax(0, bits2j - bits1j);
++        bits1[j] = bits1j;
++        bits2[j] = bits2j;
++    }
++    return interp_bits2pulses(m, end, skip_start, bits1, bits2, thresh, cap, total, balance, skip_rsv, intensity,
++                              intensity_rsv, dual_stereo, dual_stereo_rsv, pulses, ebits, fine_priority, prev_coded,
++                              signal_bw, ec);
++}
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_analysis.c b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_analysis.c
+new file mode 100644
+index 0000000..6f33327
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_analysis.c
+@@ -0,0 +1,333 @@
++/* SSC encoder: signal analysis (transients, TF resolution, spreading, dynamic allocation, trim, stereo).
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ * Adapted from libopus 1.1 celt/celt_encoder.c and celt/bands.c, float build
++ * (Copyright 2007-2010 Xiph.Org Foundation, 2008 Gregory Maxwell, 2007-2008 CSIRO, BSD-3-Clause, see LICENSE).
++ *
++ * These are encoder decisions only: none of them has to match anything, they just pick legal values for the
++ * symbols the bitstream carries. Energies here are float log2 amplitudes relative to eMeans. */
++#include <math.h>
++#include <string.h>
++
++#include "ssc_enc_internal.h"
++
++const signed char sscenc_tf_select_table[8] = {0, -2, 0, -3, 3, 0, 1, -1}; /* CELT LM = 3 row */
++
++/* Time-domain transient detector. in: two channels, `len` samples each (channel c at in + c*len). */
++int sscenc_transient_analysis(const float *in, int len, float *tf_estimate, int *tf_chan) {
++    static const unsigned char inv_table[128] = {
++        255, 255, 156, 110, 86, 70, 59, 51, 45, 40, 37, 33, 31, 28, 26, 25, 23, 22, 21, 20, 19, 18,
++        17,  16,  16,  15,  15, 14, 13, 13, 12, 12, 12, 12, 11, 11, 11, 10, 10, 10, 9,  9,  9,  9,
++        9,   9,   8,   8,   8,  8,  8,  7,  7,  7,  7,  7,  7,  6,  6,  6,  6,  6,  6,  6,  6,  6,
++        6,   6,   6,   6,   6,  6,  6,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  4,  4,  4,
++        4,   4,   4,   4,   4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,
++        3,   3,   3,   3,   3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  2,
++    };
++    float tmp[SSCE_N + SSCE_OVERLAP];
++    int i, c, len2 = len / 2, mask_metric = 0;
++    float tf_max;
++    *tf_chan = 0;
++    for (c = 0; c < SSCE_C; c++) {
++        float mean = 0, mem0 = 0, mem1 = 0, maxE = 0, norm;
++        int unmask = 0;
++        const float *x = in + c * len;
++        /* high-pass filter (1 - 2z^-1 + z^-2) / (1 - z^-1 + .5 z^-2) */
++        for (i = 0; i < len; i++) {
++            float y = mem0 + x[i];
++            mem0 = mem1 + y - 2 * x[i];
++            mem1 = x[i] - .5f * y;
++            tmp[i] = y;
++        }
++        for (i = 0; i < 12; i++) tmp[i] = 0;
++        mem0 = 0;
++        /* forward pass: post-echo threshold */
++        for (i = 0; i < len2; i++) {
++            float x2 = tmp[2 * i] * tmp[2 * i] + tmp[2 * i + 1] * tmp[2 * i + 1];
++            mean += x2;
++            tmp[i] = mem0 + .0625f * (x2 - mem0);
++            mem0 = tmp[i];
++        }
++        mem0 = 0;
++        /* backward pass: pre-echo threshold */
++        for (i = len2 - 1; i >= 0; i--) {
++            tmp[i] = mem0 + .125f * (tmp[i] - mem0);
++            mem0 = tmp[i];
++            if (mem0 > maxE) maxE = mem0;
++        }
++        mean = sqrtf(mean * maxE * .5f * len2);
++        norm = (float)len2 / (1e-15f + mean);
++        for (i = 12; i < len2 - 5; i += 4) {
++            int id = (int)floorf(64 * norm * tmp[i]);
++            if (id < 0) id = 0;
++            if (id > 127) id = 127;
++            unmask += inv_table[id];
++        }
++        unmask = 64 * unmask * 4 / (6 * (len2 - 17));
++        if (unmask > mask_metric) {
++            *tf_chan = c;
++            mask_metric = unmask;
++        }
++    }
++    tf_max = sqrtf(27.f * mask_metric) - 42.f;
++    if (tf_max < 0) tf_max = 0;
++    {
++        float t = .0069f * (tf_max < 163.f ? tf_max : 163.f) - .139f;
++        *tf_estimate = sqrtf(t > 0 ? t : 0);
++    }
++    return mask_metric > 200;
++}
++
++/* Sudden energy increase that the time-domain detector missed. newE/oldE: [c*22+i] float log2. */
++int sscenc_patch_transient_decision(const float *newE, const float *oldE, int end) {
++    int i, c;
++    float mean_diff = 0, spread_old[SSCE_NB];
++    spread_old[0] = oldE[0] > oldE[SSCE_NB] ? oldE[0] : oldE[SSCE_NB];
++    for (i = 1; i < end; i++) {
++        float a = spread_old[i - 1] - 1.f, b = oldE[i] > oldE[i + SSCE_NB] ? oldE[i] : oldE[i + SSCE_NB];
++        spread_old[i] = a > b ? a : b;
++    }
++    for (i = end - 2; i >= 0; i--)
++        if (spread_old[i + 1] - 1.f > spread_old[i]) spread_old[i] = spread_old[i + 1] - 1.f;
++    for (c = 0; c < SSCE_C; c++)
++        for (i = 2; i < end - 1; i++) {
++            float x1 = newE[i + c * SSCE_NB] > 0 ? newE[i + c * SSCE_NB] : 0;
++            float x2 = spread_old[i] > 0 ? spread_old[i] : 0;
++            if (x1 > x2) mean_diff += x1 - x2;
++        }
++    mean_diff /= SSCE_C * (end - 3);
++    return mean_diff > 1.f;
++}
++
++static float l1_metric(const float *tmp, int N, int LM, float bias) {
++    int i;
++    float L1 = 0;
++    for (i = 0; i < N; i++) L1 += fabsf(tmp[i]);
++    return L1 + LM * bias * L1;
++}
++
++/* Chooses the per-band time-frequency resolution (Viterbi over a L1-norm sparsity metric). */
++int sscenc_tf_analysis(const sscenc_mode *m, int len, int isTransient, int *tf_res, int lambda, const float *X,
++                       float tf_estimate, int tf_chan) {
++    const int LM = SSCE_LM;
++    int metric[SSCE_NB], path0[SSCE_NB], path1[SSCE_NB], selcost[2];
++    float tmp[SSCE_MAX_BAND_N], tmp_1[SSCE_MAX_BAND_N];
++    int i, sel, tf_select = 0, cost0, cost1;
++    float bias = .04f * (.5f - tf_estimate > -.25f ? .5f - tf_estimate : -.25f);
++
++    for (i = 0; i < len; i++) {
++        int j, k, N = (m->eBands[i + 1] - m->eBands[i]) << LM, best_level = 0;
++        int narrow = (m->eBands[i + 1] - m->eBands[i]) == 1;
++        float L1, best_L1;
++        for (j = 0; j < N; j++) tmp[j] = X[tf_chan * SSCE_N + j + (m->eBands[i] << LM)];
++        L1 = l1_metric(tmp, N, isTransient ? LM : 0, bias);
++        best_L1 = L1;
++        if (isTransient && !narrow) {
++            memcpy(tmp_1, tmp, sizeof(float) * N);
++            sscenc_haar1(tmp_1, N >> LM, 1 << LM);
++            L1 = l1_metric(tmp_1, N, LM + 1, bias);
++            if (L1 < best_L1) {
++                best_L1 = L1;
++                best_level = -1;
++            }
++        }
++        for (k = 0; k < LM + !(isTransient || narrow); k++) {
++            int B = isTransient ? (LM - k - 1) : k + 1;
++            sscenc_haar1(tmp, N >> k, 1 << k);
++            L1 = l1_metric(tmp, N, B, bias);
++            if (L1 < best_L1) {
++                best_L1 = L1;
++                best_level = k + 1;
++            }
++        }
++        metric[i] = isTransient ? 2 * best_level : -2 * best_level;
++        if (narrow && (metric[i] == 0 || metric[i] == -2 * LM)) metric[i] -= 1;
++    }
++    for (sel = 0; sel < 2; sel++) {
++        cost0 = 0;
++        cost1 = isTransient ? 0 : lambda;
++        for (i = 1; i < len; i++) {
++            int curr0 = sscenc_imin(cost0, cost1 + lambda), curr1 = sscenc_imin(cost0 + lambda, cost1);
++            int d0 = metric[i] - 2 * sscenc_tf_select_table[4 * isTransient + 2 * sel + 0];
++            int d1 = metric[i] - 2 * sscenc_tf_select_table[4 * isTransient + 2 * sel + 1];
++            cost0 = curr0 + (d0 < 0 ? -d0 : d0);
++            cost1 = curr1 + (d1 < 0 ? -d1 : d1);
++        }
++        selcost[sel] = sscenc_imin(cost0, cost1);
++    }
++    if (selcost[1] < selcost[0] && isTransient) tf_select = 1;
++    cost0 = 0;
++    cost1 = isTransient ? 0 : lambda;
++    for (i = 1; i < len; i++) {
++        int from0 = cost0, from1 = cost1 + lambda, curr0, curr1, d0, d1;
++        if (from0 < from1) { curr0 = from0; path0[i] = 0; }
++        else { curr0 = from1; path0[i] = 1; }
++        from0 = cost0 + lambda;
++        from1 = cost1;
++        if (from0 < from1) { curr1 = from0; path1[i] = 0; }
++        else { curr1 = from1; path1[i] = 1; }
++        d0 = metric[i] - 2 * sscenc_tf_select_table[4 * isTransient + 2 * tf_select + 0];
++        d1 = metric[i] - 2 * sscenc_tf_select_table[4 * isTransient + 2 * tf_select + 1];
++        cost0 = curr0 + (d0 < 0 ? -d0 : d0);
++        cost1 = curr1 + (d1 < 0 ? -d1 : d1);
++    }
++    tf_res[len - 1] = cost0 < cost1 ? 0 : 1;
++    for (i = len - 2; i >= 0; i--) tf_res[i] = tf_res[i + 1] == 1 ? path1[i + 1] : path0[i + 1];
++    return tf_select;
++}
++
++/* Spreading (rotation) decision from the peakiness of the normalised spectrum. */
++int sscenc_spreading_decision(const sscenc_mode *m, const float *X, int *average, int last_decision, int end) {
++    const short *eBands = m->eBands;
++    int i, c, sum = 0, nbBands = 0, decision;
++    if (SSCE_M * (eBands[end] - eBands[end - 1]) <= 8) return SSCE_SPREAD_NONE;
++    for (c = 0; c < SSCE_C; c++) {
++        for (i = 0; i < end; i++) {
++            int j, N = SSCE_M * (eBands[i + 1] - eBands[i]), tmp, tcount[3] = {0, 0, 0};
++            const float *x = X + SSCE_M * eBands[i] + c * SSCE_N;
++            if (N <= 8) continue;
++            for (j = 0; j < N; j++) {
++                float x2N = x[j] * x[j] * N;
++                if (x2N < 0.25f) tcount[0]++;
++                if (x2N < 0.0625f) tcount[1]++;
++                if (x2N < 0.015625f) tcount[2]++;
++            }
++            tmp = (2 * tcount[2] >= N) + (2 * tcount[1] >= N) + (2 * tcount[0] >= N);
++            sum += tmp * 256;
++            nbBands++;
++        }
++    }
++    sum /= nbBands;
++    sum = (sum + *average) >> 1;
++    *average = sum;
++    sum = (3 * sum + (((3 - last_decision) << 7) + 64) + 2) >> 2;
++    if (sum < 80) decision = SSCE_SPREAD_AGGRESSIVE;
++    else if (sum < 256) decision = SSCE_SPREAD_NORMAL;
++    else if (sum < 384) decision = SSCE_SPREAD_LIGHT;
++    else decision = SSCE_SPREAD_NONE;
++    return decision;
++}
++
++/* Dynamic allocation: boosts bands that stick out of a smoothed spectral envelope. offsets[] receives the
++ * number of boost quanta wanted per band (the caller codes them). CBR rules: non-transient frames get half
++ * the boost, and the total is limited to a quarter of the frame. */
++void sscenc_dynalloc_analysis(const sscenc_mode *m, const float *bandLogE, const float *bandLogE2, int end,
++                              int *offsets, int lsb_depth, int isTransient, int effectiveBytes) {
++    const short *eBands = m->eBands;
++    float follower[SSCE_C * SSCE_NB], noise_floor[SSCE_NB];
++    int32_t tot_boost = 0;
++    int i, c;
++    for (i = 0; i < SSCE_NB; i++) offsets[i] = 0;
++    if (effectiveBytes <= 50) return;
++    for (i = 0; i < end; i++)
++        noise_floor[i] = .0625f * m->logN[i] + .5f + (9 - lsb_depth) - sscenc_eMeans[i] + .0062f * (i + 5) * (i + 5);
++    for (c = 0; c < SSCE_C; c++) {
++        const float *E2 = bandLogE2 + c * SSCE_NB;
++        float *f = follower + c * SSCE_NB;
++        int last = 0;
++        f[0] = E2[0];
++        for (i = 1; i < end; i++) {
++            if (E2[i] > E2[i - 1] + .5f) last = i;
++            f[i] = f[i - 1] + 1.5f < E2[i] ? f[i - 1] + 1.5f : E2[i];
++        }
++        for (i = last - 1; i >= 0; i--) {
++            float a = f[i + 1] + 2.f < E2[i] ? f[i + 1] + 2.f : E2[i];
++            if (a < f[i]) f[i] = a;
++        }
++        for (i = 0; i < end; i++)
++            if (f[i] < noise_floor[i]) f[i] = noise_floor[i];
++    }
++    for (i = 0; i < end; i++) {
++        float *f0 = follower + i, *f1 = follower + SSCE_NB + i, d0, d1;
++        if (*f0 - 4.f > *f1) *f1 = *f0 - 4.f;
++        if (*f1 - 4.f > *f0) *f0 = *f1 - 4.f;
++        d0 = bandLogE[i] - *f0;
++        d1 = bandLogE[SSCE_NB + i] - *f1;
++        follower[i] = .5f * ((d0 > 0 ? d0 : 0) + (d1 > 0 ? d1 : 0));
++    }
++    if (!isTransient)
++        for (i = 0; i < end; i++) follower[i] *= .5f;
++    for (i = 0; i < end; i++) {
++        int width = SSCE_C * (eBands[i + 1] - eBands[i]) << SSCE_LM, boost, boost_bits;
++        int quanta = sscenc_imin(width << SSCE_BITRES, sscenc_imax(6 << SSCE_BITRES, width));
++        if (i < 8) follower[i] *= 2;
++        if (i >= 12) follower[i] *= .5f;
++        if (follower[i] > 4.f) follower[i] = 4.f;
++        if (width > 48) {
++            boost = (int)(follower[i] * 8);
++            boost_bits = (boost * width << SSCE_BITRES) / 8;
++        } else {
++            boost = (int)(follower[i] * width / 6);
++            boost_bits = boost * 6 << SSCE_BITRES;
++        }
++        /* boost is in units of the band's coding quantum */
++        boost = boost_bits / quanta;
++        boost_bits = boost * quanta;
++        if ((tot_boost + boost_bits) >> SSCE_BITRES >> 3 > effectiveBytes / 4) {
++            int32_t cap = (int32_t)(effectiveBytes / 4) << SSCE_BITRES << 3;
++            offsets[i] = (int)((cap - tot_boost) / quanta);
++            break;
++        }
++        offsets[i] = boost;
++        tot_boost += boost_bits;
++    }
++}
++
++/* Allocation trim: spectral tilt, inter-channel correlation and transient-ness. */
++int sscenc_alloc_trim_analysis(const sscenc_mode *m, const float *X, const float *bandLogE, int end,
++                               float *stereo_saving, float tf_estimate, int intensity) {
++    const int LM = SSCE_LM;
++    int i, c, trim_index;
++    float diff = 0, trim = 5.f, sum = 0, minXC, logXC, logXC2;
++    for (i = 0; i < 8; i++) {
++        int j;
++        float partial = 0;
++        for (j = m->eBands[i] << LM; j < m->eBands[i + 1] << LM; j++) partial += X[j] * X[SSCE_N + j];
++        sum += partial;
++    }
++    sum *= 1.f / 8;
++    sum = fabsf(sum) < 1.f ? fabsf(sum) : 1.f;
++    minXC = sum;
++    for (i = 8; i < intensity; i++) {
++        int j;
++        float partial = 0;
++        for (j = m->eBands[i] << LM; j < m->eBands[i + 1] << LM; j++) partial += X[j] * X[SSCE_N + j];
++        if (fabsf(partial) < minXC) minXC = fabsf(partial);
++    }
++    if (minXC > 1.f) minXC = 1.f;
++    logXC = log2f(1.001f - sum * sum);
++    logXC2 = log2f(1.001f - minXC * minXC);
++    if (.5f * logXC > logXC2) logXC2 = .5f * logXC;
++    trim += (.75f * logXC > -4.f) ? .75f * logXC : -4.f;
++    if (*stereo_saving + .25f < -.5f * logXC2) *stereo_saving += .25f;
++    else *stereo_saving = -.5f * logXC2;
++
++    for (c = 0; c < SSCE_C; c++)
++        for (i = 0; i < end - 1; i++) diff += bandLogE[i + c * SSCE_NB] * (float)(2 + 2 * i - end);
++    diff /= SSCE_C * (end - 1);
++    {
++        float t = (diff + 1.f) / 6;
++        if (t > 2.f) t = 2.f;
++        if (t < -2.f) t = -2.f;
++        trim -= t;
++    }
++    trim -= 2 * tf_estimate;
++    trim_index = (int)floorf(.5f + trim);
++    if (trim_index < 0) trim_index = 0;
++    if (trim_index > 10) trim_index = 10;
++    return trim_index;
++}
++
++/* Dual (L/R) stereo vs mid/side, from an L1 entropy estimate over the 13 lowest bands. */
++int sscenc_stereo_analysis(const sscenc_mode *m, const float *X) {
++    const int LM = SSCE_LM;
++    int i, j;
++    float sumLR = 1e-15f, sumMS = 1e-15f;
++    for (i = 0; i < 13; i++)
++        for (j = m->eBands[i] << LM; j < m->eBands[i + 1] << LM; j++) {
++            float L = X[j], R = X[SSCE_N + j], Mi = L + R, S = L - R;
++            sumLR += fabsf(L) + fabsf(R);
++            sumMS += fabsf(Mi) + fabsf(S);
++        }
++    sumMS *= 0.707107f;
++    return ((m->eBands[13] << (LM + 1)) + 13) * sumMS > (m->eBands[13] << (LM + 1)) * sumLR;
++}
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_bands.c b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_bands.c
+new file mode 100644
+index 0000000..f21ff48
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_bands.c
+@@ -0,0 +1,499 @@
++/* SSC encoder: band shape quantisation (PVQ), stereo and time-frequency splitting.
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ * Adapted from libopus 1.1 celt/bands.c, celt/vq.c and celt/cwrs.c
++ * (Copyright 2007-2009 Xiph.Org Foundation, 2008-2009 Gregory Maxwell, 2007-2008 CSIRO,
++ *  2007-2009 Timothy B. Terriberry, BSD-3-Clause, see LICENSE).
++ *
++ * This is the encode half of quant_all_bands. It does not resynthesise: the decoder's folding memory,
++ * collapse masks and noise filling never change the bitstream syntax, only the decoded audio, so the encoder
++ * does not need them. What it must follow exactly is the integer bit bookkeeping (b, balance, qalloc,
++ * remaining_bits, pulse counts), which is a mirror of the decoder. Bands are always >= 8 bins wide
++ * (LM = 3), so CELT's N == 1 and N == 2 special cases cannot occur. */
++#include <math.h>
++#include <string.h>
++
++#include "ssc_enc_internal.h"
++
++#define QTHETA_OFFSET   4
++#define LOG_MAX_PSEUDO  6
++#define NFREQ           SSCE_N
++
++/* cos(pi/2 * x) for x in [0, 1]: even polynomial, max error 2e-5 (the decoder uses the same one, so the spreading
++ * rotation it undoes is exactly the one applied here). */
++float sscenc_cos_half_pi(float x) {
++    float x2 = x * x;
++    return 1.f + x2 * (-1.2336979f + x2 * (0.25366235f + x2 * (-0.020863481f + x2 * 0.00091892557f)));
++}
++
++/* ---- bit-exact integer helpers (they drive the allocation inside a band) ---- */
++static int frac_mul16(int a, int b) { return (16384 + (int32_t)(int16_t)a * (int16_t)b) >> 15; }
++
++static int bitexact_cos(int x) {
++    int32_t tmp = (4096 + (int32_t)x * x) >> 13;
++    int x2 = (int)tmp;
++    x2 = (32767 - x2) + frac_mul16(x2, (-7651 + frac_mul16(x2, (8277 + frac_mul16(-626, x2)))));
++    return 1 + x2;
++}
++
++static int bitexact_log2tan(int isin, int icos) {
++    int lc = sscenc_ilog((uint32_t)icos), ls = sscenc_ilog((uint32_t)isin);
++    icos <<= 15 - lc;
++    isin <<= 15 - ls;
++    return (ls - lc) * (1 << 11) + frac_mul16(isin, frac_mul16(isin, -2597) + 7932) -
++           frac_mul16(icos, frac_mul16(icos, -2597) + 7932);
++}
++
++static int compute_qn(int N, int b, int offset, int pulse_cap) {
++    static const int16_t exp2_table8[8] = {16384, 17866, 19483, 21247, 23170, 25267, 27554, 30048};
++    int qn, qb, N2 = 2 * N - 1;
++    qb = sscenc_imin(b - pulse_cap - (4 << SSCE_BITRES), (b + N2 * offset) / N2);
++    qb = sscenc_imin(8 << SSCE_BITRES, qb);
++    if (qb < (1 << SSCE_BITRES >> 1)) {
++        qn = 1;
++    } else {
++        qn = exp2_table8[qb & 0x7] >> (14 - (qb >> SSCE_BITRES));
++        qn = (qn + 1) >> 1 << 1;
++    }
++    return qn;
++}
++
++static int get_pulses(int i) { return i < 8 ? i : (8 + (i & 7)) << ((i >> 3) - 1); }
++
++static const unsigned char *band_cache(const sscenc_mode *m, int band, int LM) {
++    return m->cache_bits + m->cache_index[(LM + 1) * SSCE_NB + band];
++}
++
++static int bits2pulses(const sscenc_mode *m, int band, int LM, int bits) {
++    const unsigned char *cache = band_cache(m, band, LM);
++    int i, lo = 0, hi = cache[0];
++    bits--;
++    for (i = 0; i < LOG_MAX_PSEUDO; i++) {
++        int mid = (lo + hi + 1) >> 1;
++        if ((int)cache[mid] >= bits) hi = mid;
++        else lo = mid;
++    }
++    if (bits - (lo == 0 ? -1 : (int)cache[lo]) <= (int)cache[hi] - bits) return lo;
++    return hi;
++}
++
++static int pulses2bits(const sscenc_mode *m, int band, int LM, int pulses) {
++    const unsigned char *cache = band_cache(m, band, LM);
++    return pulses == 0 ? 0 : cache[pulses] + 1;
++}
++
++/* ---- PVQ codeword index (cwrs.c, table form) ---- */
++#define PVQ_U(n, k) (sscenc_pvq_u_row[sscenc_imin(n, k)][sscenc_imax(n, k)])
++#define PVQ_V(n, k) (PVQ_U(n, k) + PVQ_U(n, (k) + 1))
++
++static uint32_t icwrs(int n, const int *y) {
++    uint32_t i;
++    int j = n - 1, k;
++    i = y[j] < 0;
++    k = y[j] < 0 ? -y[j] : y[j];
++    do {
++        j--;
++        i += PVQ_U(n - j, k);
++        k += y[j] < 0 ? -y[j] : y[j];
++        if (y[j] < 0) i += PVQ_U(n - j, k + 1);
++    } while (j > 0);
++    return i;
++}
++
++static void encode_pulses(const int *y, int n, int k, sscenc_ec *ec) {
++    sscenc_ec_uint(ec, icwrs(n, y), PVQ_V(n, k));
++}
++
++/* ---- vq.c ---- */
++static void exp_rotation1(float *X, int len, int stride, float c, float s) {
++    int i;
++    for (i = 0; i < len - stride; i++) {
++        float x1 = X[i], x2 = X[i + stride];
++        X[i + stride] = c * x2 + s * x1;
++        X[i] = c * x1 - s * x2;
++    }
++    for (i = len - 2 * stride - 1; i >= 0; i--) {
++        float x1 = X[i], x2 = X[i + stride];
++        X[i + stride] = c * x2 + s * x1;
++        X[i] = c * x1 - s * x2;
++    }
++}
++
++static void exp_rotation(float *X, int len, int dir, int stride, int K, int spread) {
++    static const int SPREAD_FACTOR[3] = {15, 10, 5};
++    int i, stride2 = 0, factor;
++    float gain, theta, c, s;
++    if (2 * K >= len || spread == SSCE_SPREAD_NONE) return;
++    factor = SPREAD_FACTOR[spread - 1];
++    gain = (float)len / (float)(len + factor * K);
++    theta = 0.5f * gain * gain;
++    c = sscenc_cos_half_pi(theta);
++    s = sscenc_cos_half_pi(1.0f - theta);
++    if (len >= 8 * stride) {
++        stride2 = 1;
++        while ((stride2 * stride2 + stride2) * stride + (stride >> 2) < len) stride2++;
++    }
++    len /= stride;
++    for (i = 0; i < stride; i++) {
++        if (dir < 0) {
++            if (stride2) exp_rotation1(X + i * len, len, stride2, s, c);
++            exp_rotation1(X + i * len, len, 1, c, s);
++        } else {
++            exp_rotation1(X + i * len, len, 1, c, -s);
++            if (stride2) exp_rotation1(X + i * len, len, stride2, s, -c);
++        }
++    }
++}
++
++/* Pulse search: finds the integer vector y with sum|y| = K that maximises <x,y>/|y|. */
++static void alg_quant(float *X, int N, int K, int spread, int B, sscenc_ec *ec) {
++    float y[SSCE_MAX_BAND_N], absx[SSCE_MAX_BAND_N];
++    int iy[SSCE_MAX_BAND_N], j, i, pulsesLeft;
++    float sum = 0, xy = 0, yy = 0;
++
++    exp_rotation(X, N, 1, B, K, spread);
++    for (j = 0; j < N; j++) {
++        absx[j] = fabsf(X[j]);
++        iy[j] = 0;
++        y[j] = 0;
++    }
++    pulsesLeft = K;
++    /* Pre-search by projecting on the pyramid */
++    if (K > (N >> 1)) {
++        float rcp;
++        for (j = 0; j < N; j++) sum += absx[j];
++        if (!(sum > 1e-15f && sum < 64.f)) {
++            absx[0] = 1.f;
++            for (j = 1; j < N; j++) absx[j] = 0;
++            sum = 1.f;
++        }
++        rcp = (float)(K - 1) / sum;
++        for (j = 0; j < N; j++) {
++            iy[j] = (int)floorf(rcp * absx[j]);
++            y[j] = (float)iy[j];
++            yy += y[j] * y[j];
++            xy += absx[j] * y[j];
++            y[j] *= 2;
++            pulsesLeft -= iy[j];
++        }
++    }
++    if (pulsesLeft > N + 3) {
++        float tmp = (float)pulsesLeft;
++        yy += tmp * tmp + tmp * y[0];
++        iy[0] += pulsesLeft;
++        pulsesLeft = 0;
++    }
++    for (i = 0; i < pulsesLeft; i++) {
++        int best_id = 0;
++        float best_num = -1e10f, best_den = 0;
++        yy += 1;
++        for (j = 0; j < N; j++) {
++            float Rxy = xy + absx[j], Ryy = yy + y[j];
++            Rxy = Rxy * Rxy;
++            if (best_den * Rxy > Ryy * best_num) {
++                best_den = Ryy;
++                best_num = Rxy;
++                best_id = j;
++            }
++        }
++        xy += absx[best_id];
++        yy += y[best_id];
++        y[best_id] += 2;
++        iy[best_id]++;
++    }
++    for (j = 0; j < N; j++)
++        if (X[j] < 0) iy[j] = -iy[j];
++    encode_pulses(iy, N, K, ec);
++}
++
++static int stereo_itheta(const float *X, const float *Y, int stereo, int N) {
++    int i;
++    float Emid = 1e-15f, Eside = 1e-15f;
++    if (stereo) {
++        for (i = 0; i < N; i++) {
++            float m = 0.5f * (X[i] + Y[i]), s = 0.5f * (X[i] - Y[i]);
++            Emid += m * m;
++            Eside += s * s;
++        }
++    } else {
++        for (i = 0; i < N; i++) {
++            Emid += X[i] * X[i];
++            Eside += Y[i] * Y[i];
++        }
++    }
++    return (int)floor(.5f + 16384 * 0.63662f * atan2(sqrtf(Eside), sqrtf(Emid)));
++}
++
++/* ---- bands.c helpers ---- */
++void sscenc_haar1(float *X, int N0, int stride) {
++    int i, j;
++    N0 >>= 1;
++    for (i = 0; i < stride; i++)
++        for (j = 0; j < N0; j++) {
++            float t1 = 0.70710678f * X[stride * 2 * j + i];
++            float t2 = 0.70710678f * X[stride * (2 * j + 1) + i];
++            X[stride * 2 * j + i] = t1 + t2;
++            X[stride * (2 * j + 1) + i] = t1 - t2;
++        }
++}
++
++static const int ordery_table[] = {
++    1, 0, 3, 0, 2, 1, 7, 0, 4, 3, 6, 1, 5, 2, 15, 0, 8, 7, 12, 3, 11, 4, 14, 1, 9, 6, 13, 2, 10, 5,
++};
++
++static void deinterleave_hadamard(float *X, int N0, int stride, int hadamard) {
++    float tmp[SSCE_MAX_BAND_N];
++    int i, j, N = N0 * stride;
++    if (hadamard) {
++        const int *ordery = ordery_table + stride - 2;
++        for (i = 0; i < stride; i++)
++            for (j = 0; j < N0; j++) tmp[ordery[i] * N0 + j] = X[j * stride + i];
++    } else {
++        for (i = 0; i < stride; i++)
++            for (j = 0; j < N0; j++) tmp[i * N0 + j] = X[j * stride + i];
++    }
++    memcpy(X, tmp, (size_t)N * sizeof(float));
++}
++
++static void intensity_stereo(float *X, const float *Y, float left, float right, int N) {
++    int j;
++    float norm = 1e-15f + sqrtf(1e-15f + left * left + right * right);
++    float a1 = left / norm, a2 = right / norm;
++    for (j = 0; j < N; j++) X[j] = a1 * X[j] + a2 * Y[j];
++}
++
++static void stereo_split(float *X, float *Y, int N) {
++    int j;
++    for (j = 0; j < N; j++) {
++        float l = 0.70710678f * X[j], r = 0.70710678f * Y[j];
++        X[j] = l + r;
++        Y[j] = r - l;
++    }
++}
++
++/* ---- band coding context ---- */
++typedef struct {
++    const sscenc_mode *m;
++    int i;
++    int intensity;
++    int spread;
++    int tf_change;
++    sscenc_ec *ec;
++    int32_t remaining_bits;
++    const float *bandE;
++} band_ctx;
++
++typedef struct {
++    int inv, imid, iside, delta, itheta, qalloc;
++} split_ctx;
++
++static void compute_theta(band_ctx *ctx, split_ctx *sctx, float *X, float *Y, int N, int *b, int B0, int LM,
++                          int stereo) {
++    const sscenc_mode *m = ctx->m;
++    const int i = ctx->i;
++    sscenc_ec *ec = ctx->ec;
++    int qn, itheta, delta, imid, iside, qalloc, pulse_cap, offset, inv = 0;
++    int32_t tell;
++
++    pulse_cap = m->logN[i] + LM * (1 << SSCE_BITRES);
++    offset = (pulse_cap >> 1) - QTHETA_OFFSET;
++    qn = compute_qn(N, *b, offset, pulse_cap);
++    if (stereo && i >= ctx->intensity) qn = 1;
++    itheta = stereo_itheta(X, Y, stereo, N);
++    tell = (int32_t)sscenc_ec_tell_frac(ec);
++    if (qn != 1) {
++        itheta = (itheta * qn + 8192) >> 14;
++        if (stereo && N > 2) {
++            /* step pdf: probability 3 up to qn/2, then 1 */
++            const int p0 = 3, x = itheta, x0 = qn / 2, ft = p0 * (x0 + 1) + x0;
++            sscenc_ec_encode(ec, (unsigned)(x <= x0 ? p0 * x : (x - 1 - x0) + (x0 + 1) * p0),
++                             (unsigned)(x <= x0 ? p0 * (x + 1) : (x - x0) + (x0 + 1) * p0), (unsigned)ft);
++        } else if (B0 > 1 || stereo) {
++            sscenc_ec_uint(ec, (uint32_t)itheta, (uint32_t)qn + 1); /* uniform */
++        } else {
++            /* triangular */
++            int ft = ((qn >> 1) + 1) * ((qn >> 1) + 1);
++            int fs = itheta <= (qn >> 1) ? itheta + 1 : qn + 1 - itheta;
++            int fl = itheta <= (qn >> 1) ? itheta * (itheta + 1) >> 1
++                                         : ft - ((qn + 1 - itheta) * (qn + 2 - itheta) >> 1);
++            sscenc_ec_encode(ec, (unsigned)fl, (unsigned)(fl + fs), (unsigned)ft);
++        }
++        itheta = (int32_t)itheta * 16384 / qn;
++        if (stereo) {
++            if (itheta == 0)
++                intensity_stereo(X, Y, ctx->bandE[i], ctx->bandE[i + SSCE_NB], N);
++            else
++                stereo_split(X, Y, N);
++        }
++    } else if (stereo) {
++        int j;
++        inv = itheta > 8192;
++        if (inv)
++            for (j = 0; j < N; j++) Y[j] = -Y[j];
++        intensity_stereo(X, Y, ctx->bandE[i], ctx->bandE[i + SSCE_NB], N);
++        if (*b > 2 << SSCE_BITRES && ctx->remaining_bits > 2 << SSCE_BITRES) sscenc_ec_bit_logp(ec, inv, 2);
++        else inv = 0;
++        itheta = 0;
++    } else {
++        itheta = 0; /* qn == 1 in a time/frequency split: nothing is coded */
++    }
++    qalloc = (int)((int32_t)sscenc_ec_tell_frac(ec) - tell);
++    *b -= qalloc;
++
++    if (itheta == 0) {
++        imid = 32767;
++        iside = 0;
++        delta = -16384;
++    } else if (itheta == 16384) {
++        imid = 0;
++        iside = 32767;
++        delta = 16384;
++    } else {
++        imid = bitexact_cos(itheta);
++        iside = bitexact_cos(16384 - itheta);
++        delta = frac_mul16((N - 1) << 7, bitexact_log2tan(iside, imid));
++    }
++    sctx->inv = inv;
++    sctx->imid = imid;
++    sctx->iside = iside;
++    sctx->delta = delta;
++    sctx->itheta = itheta;
++    sctx->qalloc = qalloc;
++}
++
++static void quant_partition(band_ctx *ctx, float *X, int N, int b, int B, int LM) {
++    const sscenc_mode *m = ctx->m;
++    const int i = ctx->i, B0 = B;
++    const unsigned char *cache = band_cache(m, i, LM);
++
++    if (LM != -1 && b > cache[cache[0]] + 12 && N > 2) {
++        int mbits, sbits, delta, itheta, qalloc;
++        split_ctx sctx;
++        float *Y;
++        int32_t rebalance;
++
++        N >>= 1;
++        Y = X + N;
++        LM -= 1;
++        B = (B + 1) >> 1;
++        compute_theta(ctx, &sctx, X, Y, N, &b, B0, LM, 0);
++        delta = sctx.delta;
++        itheta = sctx.itheta;
++        qalloc = sctx.qalloc;
++        if (B0 > 1 && (itheta & 0x3fff)) {
++            if (itheta > 8192) delta -= delta >> (4 - LM);
++            else delta = sscenc_imin(0, delta + (N << SSCE_BITRES >> (5 - LM)));
++        }
++        mbits = sscenc_imax(0, sscenc_imin(b, (b - delta) / 2));
++        sbits = b - mbits;
++        ctx->remaining_bits -= qalloc;
++        rebalance = ctx->remaining_bits;
++        if (mbits >= sbits) {
++            quant_partition(ctx, X, N, mbits, B, LM);
++            rebalance = mbits - (rebalance - ctx->remaining_bits);
++            if (rebalance > 3 << SSCE_BITRES && itheta != 0) sbits += rebalance - (3 << SSCE_BITRES);
++            quant_partition(ctx, Y, N, sbits, B, LM);
++        } else {
++            quant_partition(ctx, Y, N, sbits, B, LM);
++            rebalance = sbits - (rebalance - ctx->remaining_bits);
++            if (rebalance > 3 << SSCE_BITRES && itheta != 16384) mbits += rebalance - (3 << SSCE_BITRES);
++            quant_partition(ctx, X, N, mbits, B, LM);
++        }
++    } else {
++        int q = bits2pulses(m, i, LM, b), curr_bits = pulses2bits(m, i, LM, q);
++        ctx->remaining_bits -= curr_bits;
++        while (ctx->remaining_bits < 0 && q > 0) {
++            ctx->remaining_bits += curr_bits;
++            q--;
++            curr_bits = pulses2bits(m, i, LM, q);
++            ctx->remaining_bits -= curr_bits;
++        }
++        if (q != 0) alg_quant(X, N, get_pulses(q), ctx->spread, B, ctx->ec);
++    }
++}
++
++static void quant_band(band_ctx *ctx, float *X, int N, int b, int B, int LM) {
++    int N_B = N / B, B0, k, recombine = 0, longBlocks = B == 1, tf_change = ctx->tf_change;
++    if (tf_change > 0) recombine = tf_change;
++    for (k = 0; k < recombine; k++) sscenc_haar1(X, N >> k, 1 << k);
++    B >>= recombine;
++    N_B <<= recombine;
++    while ((N_B & 1) == 0 && tf_change < 0) {
++        sscenc_haar1(X, N_B, B);
++        B <<= 1;
++        N_B >>= 1;
++        tf_change++;
++    }
++    B0 = B;
++    if (B0 > 1) deinterleave_hadamard(X, N_B >> recombine, B0 << recombine, longBlocks);
++    quant_partition(ctx, X, N, b, B, LM);
++}
++
++static void quant_band_stereo(band_ctx *ctx, float *X, float *Y, int N, int b, int B, int LM) {
++    split_ctx sctx;
++    int mbits, sbits, delta, itheta, qalloc;
++    int32_t rebalance;
++
++    compute_theta(ctx, &sctx, X, Y, N, &b, B, LM, 1);
++    delta = sctx.delta;
++    itheta = sctx.itheta;
++    qalloc = sctx.qalloc;
++    mbits = sscenc_imax(0, sscenc_imin(b, (b - delta) / 2));
++    sbits = b - mbits;
++    ctx->remaining_bits -= qalloc;
++    rebalance = ctx->remaining_bits;
++    if (mbits >= sbits) {
++        quant_band(ctx, X, N, mbits, B, LM);
++        rebalance = mbits - (rebalance - ctx->remaining_bits);
++        if (rebalance > 3 << SSCE_BITRES && itheta != 0) sbits += rebalance - (3 << SSCE_BITRES);
++        quant_band(ctx, Y, N, sbits, B, LM);
++    } else {
++        quant_band(ctx, Y, N, sbits, B, LM);
++        rebalance = sbits - (rebalance - ctx->remaining_bits);
++        if (rebalance > 3 << SSCE_BITRES && itheta != 16384) mbits += rebalance - (3 << SSCE_BITRES);
++        quant_band(ctx, X, N, mbits, B, LM);
++    }
++}
++
++/* X, Y: normalised spectra of the two channels (modified in place). bandE: linear band amplitudes [c*22+i]. */
++void sscenc_quant_all_bands(const sscenc_mode *m, int end, float *X_, float *Y_, const float *bandE,
++                            const int *pulses, int shortBlocks, int spread, int dual_stereo, int intensity,
++                            const int *tf_res, int32_t total_bits, int32_t balance, sscenc_ec *ec, int codedBands) {
++    const short *eBands = m->eBands;
++    const int M = SSCE_M, LM = SSCE_LM, B = shortBlocks ? M : 1;
++    band_ctx ctx;
++    int i;
++
++    ctx.m = m;
++    ctx.ec = ec;
++    ctx.intensity = intensity;
++    ctx.spread = spread;
++    ctx.bandE = bandE;
++    for (i = 0; i < end; i++) {
++        int32_t tell, remaining_bits, curr_balance;
++        int b, N;
++        float *X = X_ + M * eBands[i], *Y = Y_ + M * eBands[i];
++
++        ctx.i = i;
++        N = M * eBands[i + 1] - M * eBands[i];
++        tell = (int32_t)sscenc_ec_tell_frac(ec);
++        if (i != 0) balance -= tell;
++        remaining_bits = total_bits - tell - 1;
++        ctx.remaining_bits = remaining_bits;
++        if (i <= codedBands - 1) {
++            curr_balance = balance / sscenc_imin(3, codedBands - i);
++            b = sscenc_imax(0, sscenc_imin(16383, sscenc_imin(remaining_bits + 1, pulses[i] + curr_balance)));
++        } else {
++            b = 0;
++        }
++        ctx.tf_change = tf_res[i];
++        if (dual_stereo && i == intensity) dual_stereo = 0;
++        if (dual_stereo) {
++            quant_band(&ctx, X, N, b / 2, B, LM);
++            quant_band(&ctx, Y, N, b / 2, B, LM);
++        } else {
++            quant_band_stereo(&ctx, X, Y, N, b, B, LM);
++        }
++        balance += pulses[i] + tell;
++    }
++}
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_ec.c b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_ec.c
+new file mode 100644
+index 0000000..889ad78
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_ec.c
+@@ -0,0 +1,241 @@
++/* SSC encoder: range encoder.
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ * Adapted from libopus 1.1 celt/entenc.c, celt/entcode.c and celt/laplace.c
++ * (Copyright 2001-2011 Timothy B. Terriberry, Xiph.Org Foundation, BSD-3-Clause, see LICENSE).
++ *
++ * The only change from opus is the coder width: SSC uses EC_CODE_BITS = 24 instead of 32, so the
++ * range is kept in [2^15, 2^23]. Raw bits (ec_enc_bits) are packed from the end of the buffer as in
++ * opus; the buffer passed to sscenc_ec_init is the whole range-coded payload. */
++#include <string.h>
++
++#include "ssc_enc_internal.h"
++
++#define EC_SYM_BITS    8
++#define EC_CODE_BITS   24
++#define EC_SYM_MAX     ((1U << EC_SYM_BITS) - 1)
++#define EC_CODE_SHIFT  (EC_CODE_BITS - EC_SYM_BITS - 1)
++#define EC_CODE_TOP    (((uint32_t)1U) << (EC_CODE_BITS - 1))
++#define EC_CODE_BOT    (EC_CODE_TOP >> EC_SYM_BITS)
++#define EC_WINDOW_SIZE 32
++#define EC_UINT_BITS   8
++
++int sscenc_ec_tell(const sscenc_ec *e) { return e->nbits_total - sscenc_ilog(e->rng); }
++
++uint32_t sscenc_ec_tell_frac(const sscenc_ec *e) {
++    uint32_t nbits = (uint32_t)e->nbits_total << SSCE_BITRES, r;
++    int l = sscenc_ilog(e->rng), i;
++    r = e->rng >> (l - 16);
++    for (i = SSCE_BITRES; i-- > 0;) {
++        int b;
++        r = r * r >> 15;
++        b = (int)(r >> 16);
++        l = l << 1 | b;
++        r >>= b;
++    }
++    return nbits - (uint32_t)l;
++}
++
++static int write_byte(sscenc_ec *e, unsigned v) {
++    if (e->offs + e->end_offs >= e->storage) return -1;
++    e->buf[e->offs++] = (unsigned char)v;
++    return 0;
++}
++
++static int write_byte_at_end(sscenc_ec *e, unsigned v) {
++    if (e->offs + e->end_offs >= e->storage) return -1;
++    e->buf[e->storage - ++(e->end_offs)] = (unsigned char)v;
++    return 0;
++}
++
++/* Outputs a symbol, with a carry bit. Runs of 0xFF are buffered until the carry is known. */
++static void carry_out(sscenc_ec *e, int c) {
++    if (c != (int)EC_SYM_MAX) {
++        int carry = c >> EC_SYM_BITS;
++        if (e->rem >= 0) e->error |= write_byte(e, (unsigned)(e->rem + carry));
++        if (e->ext > 0) {
++            unsigned sym = (EC_SYM_MAX + (unsigned)carry) & EC_SYM_MAX;
++            do e->error |= write_byte(e, sym);
++            while (--(e->ext) > 0);
++        }
++        e->rem = c & (int)EC_SYM_MAX;
++    } else {
++        e->ext++;
++    }
++}
++
++static void normalize(sscenc_ec *e) {
++    while (e->rng <= EC_CODE_BOT) {
++        carry_out(e, (int)(e->val >> EC_CODE_SHIFT));
++        e->val = (e->val << EC_SYM_BITS) & (EC_CODE_TOP - 1);
++        e->rng <<= EC_SYM_BITS;
++        e->nbits_total += EC_SYM_BITS;
++    }
++}
++
++void sscenc_ec_init(sscenc_ec *e, unsigned char *buf, uint32_t size) {
++    e->buf = buf;
++    e->end_offs = 0;
++    e->end_window = 0;
++    e->nend_bits = 0;
++    e->nbits_total = EC_CODE_BITS + 1;
++    e->offs = 0;
++    e->rng = EC_CODE_TOP;
++    e->rem = -1;
++    e->val = 0;
++    e->ext = 0;
++    e->storage = size;
++    e->error = 0;
++}
++
++void sscenc_ec_encode(sscenc_ec *e, unsigned fl, unsigned fh, unsigned ft) {
++    uint32_t r = e->rng / ft;
++    if (fl > 0) {
++        e->val += e->rng - r * (ft - fl);
++        e->rng = r * (fh - fl);
++    } else {
++        e->rng -= r * (ft - fh);
++    }
++    normalize(e);
++}
++
++void sscenc_ec_encode_bin(sscenc_ec *e, unsigned fl, unsigned fh, unsigned bits) {
++    uint32_t r = e->rng >> bits;
++    if (fl > 0) {
++        e->val += e->rng - r * ((1U << bits) - fl);
++        e->rng = r * (fh - fl);
++    } else {
++        e->rng -= r * ((1U << bits) - fh);
++    }
++    normalize(e);
++}
++
++void sscenc_ec_bit_logp(sscenc_ec *e, int val, unsigned logp) {
++    uint32_t r = e->rng, l = e->val, s = r >> logp;
++    r -= s;
++    if (val) e->val = l + r;
++    e->rng = val ? s : r;
++    normalize(e);
++}
++
++void sscenc_ec_icdf(sscenc_ec *e, int s, const unsigned char *icdf, unsigned ftb) {
++    uint32_t r = e->rng >> ftb;
++    if (s > 0) {
++        e->val += e->rng - r * icdf[s - 1];
++        e->rng = r * (uint32_t)(icdf[s - 1] - icdf[s]);
++    } else {
++        e->rng -= r * icdf[s];
++    }
++    normalize(e);
++}
++
++void sscenc_ec_bits(sscenc_ec *e, uint32_t fl, unsigned bits) {
++    uint32_t window = e->end_window;
++    int used = e->nend_bits;
++    if (used + (int)bits > EC_WINDOW_SIZE) {
++        do {
++            e->error |= write_byte_at_end(e, window & EC_SYM_MAX);
++            window >>= EC_SYM_BITS;
++            used -= EC_SYM_BITS;
++        } while (used >= EC_SYM_BITS);
++    }
++    window |= fl << used;
++    used += (int)bits;
++    e->end_window = window;
++    e->nend_bits = used;
++    e->nbits_total += (int)bits;
++}
++
++void sscenc_ec_uint(sscenc_ec *e, uint32_t fl, uint32_t ft) {
++    int ftb;
++    ft--;
++    ftb = sscenc_ilog(ft);
++    if (ftb > EC_UINT_BITS) {
++        unsigned ft1, fl1;
++        ftb -= EC_UINT_BITS;
++        ft1 = (unsigned)(ft >> ftb) + 1;
++        fl1 = (unsigned)(fl >> ftb);
++        sscenc_ec_encode(e, fl1, fl1 + 1, ft1);
++        sscenc_ec_bits(e, fl & (((uint32_t)1 << ftb) - 1U), (unsigned)ftb);
++    } else {
++        sscenc_ec_encode(e, (unsigned)fl, (unsigned)fl + 1, (unsigned)ft + 1);
++    }
++}
++
++void sscenc_ec_done(sscenc_ec *e) {
++    uint32_t window, msk, end;
++    int used, l;
++    /* Output the minimum number of bits that ensures that the symbols encoded so far are decoded correctly
++     * whatever follows. */
++    l = EC_CODE_BITS - sscenc_ilog(e->rng);
++    msk = (EC_CODE_TOP - 1) >> l;
++    end = (e->val + msk) & ~msk;
++    if ((end | msk) >= e->val + e->rng) {
++        l++;
++        msk >>= 1;
++        end = (e->val + msk) & ~msk;
++    }
++    while (l > 0) {
++        carry_out(e, (int)(end >> EC_CODE_SHIFT));
++        end = (end << EC_SYM_BITS) & (EC_CODE_TOP - 1);
++        l -= EC_SYM_BITS;
++    }
++    if (e->rem >= 0 || e->ext > 0) carry_out(e, 0);
++    window = e->end_window;
++    used = e->nend_bits;
++    while (used >= EC_SYM_BITS) {
++        e->error |= write_byte_at_end(e, window & EC_SYM_MAX);
++        window >>= EC_SYM_BITS;
++        used -= EC_SYM_BITS;
++    }
++    if (!e->error) {
++        memset(e->buf + e->offs, 0, e->storage - e->offs - e->end_offs);
++        if (used > 0) {
++            if (e->end_offs >= e->storage) {
++                e->error = -1;
++            } else {
++                l = -l;
++                if (e->offs + e->end_offs >= e->storage && l < used) {
++                    window &= (1U << l) - 1;
++                    e->error = -1;
++                }
++                e->buf[e->storage - e->end_offs - 1] |= (unsigned char)window;
++            }
++        }
++    }
++}
++
++/* ---- Laplace-like energy deltas (laplace.c, LAPLACE_MINP = 1, LAPLACE_NMIN = 16) ---- */
++static unsigned laplace_get_freq1(unsigned fs0, int decay) {
++    unsigned ft = 32768 - 2 * 16 - fs0;
++    return ft * (uint32_t)(16384 - decay) >> 15;
++}
++
++void sscenc_laplace_encode(sscenc_ec *e, int *value, unsigned fs, int decay) {
++    unsigned fl = 0;
++    int val = *value;
++    if (val) {
++        int s = -(val < 0), i;
++        val = (val + s) ^ s;
++        fl = fs;
++        fs = laplace_get_freq1(fs, decay);
++        for (i = 1; fs > 0 && i < val; i++) {
++            fs *= 2;
++            fl += fs + 2;
++            fs = (fs * (uint32_t)decay) >> 15;
++        }
++        if (!fs) {
++            int di, ndi_max;
++            ndi_max = (int)(32768 - fl);
++            ndi_max = (ndi_max - s) >> 1;
++            di = sscenc_imin(val - i, ndi_max - 1);
++            fl += (unsigned)(2 * di + 1 + s);
++            fs = sscenc_imin(1, (int)(32768 - fl));
++            *value = (i + di + s) ^ s;
++        } else {
++            fs += 1;
++            fl += fs & ~(unsigned)s;
++        }
++    }
++    sscenc_ec_encode_bin(e, fl, fl + fs, 15);
++}
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_energy.c b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_energy.c
+new file mode 100644
+index 0000000..7432797
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_energy.c
+@@ -0,0 +1,157 @@
++/* SSC encoder: band energy quantisation (coarse, fine, finalise).
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ * Adapted from libopus 1.1 celt/quant_bands.c, fixed-point arithmetic
++ * (Copyright 2007-2009 Xiph.Org Foundation, 2008-2009 Gregory Maxwell, BSD-3-Clause, see LICENSE).
++ *
++ * All values are int16 Q10 log2 amplitudes, layout [c*22 + band]. The prediction state oldE is updated
++ * with the same integer arithmetic as the decoder, so encoder and decoder stay in lock-step. SSC always
++ * codes two channels, LM = 3 (prediction 0.5, beta 0.2; intra beta 0.15) and start band 0. */
++#include <stdlib.h>
++#include <string.h>
++
++#include "ssc_enc_internal.h"
++
++#define PRED_COEF   16384 /* 0.5 Q15 */
++#define BETA_COEF   6554  /* 0.2 Q15 */
++#define BETA_INTRA  4915  /* 0.15 Q15 */
++#define Q10(x)      ((int32_t)((x) * (1 << SSCE_DB_SHIFT)))
++
++static const unsigned char small_energy_icdf[3] = {2, 1, 0};
++
++static int coarse_pass(int end, const int16_t *x, int16_t *oldE, int32_t budget, int intra, int32_t max_decay,
++                       int16_t *error, sscenc_ec *enc) {
++    const unsigned char *prob = sscenc_e_prob_model[intra ? 1 : 0];
++    int32_t prev[2] = {0, 0};
++    const int32_t coef = intra ? 0 : PRED_COEF;
++    const int32_t beta = intra ? BETA_INTRA : BETA_COEF;
++    int i, c, badness = 0;
++
++    if (sscenc_ec_tell(enc) + 3 <= budget) sscenc_ec_bit_logp(enc, intra, 3);
++    for (i = 0; i < end; i++) {
++        for (c = 0; c < SSCE_C; c++) {
++            const int k = i + c * SSCE_NB;
++            int32_t f, q, tmp, decay_bound, old = oldE[k];
++            int32_t oldc = old < -Q10(9) ? -Q10(9) : old;
++            int qi, qi0, bits_left, tell;
++            f = ((int32_t)x[k] << 7) - ((coef * oldc + 128) >> 8) - prev[c];
++            qi = (f + (1 << (SSCE_DB_SHIFT + 6))) >> (SSCE_DB_SHIFT + 7); /* round to nearest */
++            decay_bound = old - max_decay;
++            if (decay_bound < -Q10(28)) decay_bound = -Q10(28);
++            /* do not let the energy drop faster than max_decay per frame */
++            if (qi < 0 && x[k] < decay_bound) {
++                qi += (int)((decay_bound - x[k]) >> SSCE_DB_SHIFT);
++                if (qi > 0) qi = 0;
++            }
++            qi0 = qi;
++            tell = sscenc_ec_tell(enc);
++            bits_left = budget - tell - 3 * SSCE_C * (end - i);
++            if (i != 0 && bits_left < 30) {
++                if (bits_left < 24) qi = sscenc_imin(1, qi);
++                if (bits_left < 16) qi = sscenc_imax(-1, qi);
++            }
++            if (budget - tell >= 15) {
++                int pi = 2 * sscenc_imin(i, 20);
++                sscenc_laplace_encode(enc, &qi, (unsigned)prob[pi] << 7, prob[pi + 1] << 6);
++            } else if (budget - tell >= 2) {
++                qi = sscenc_imax(-1, sscenc_imin(qi, 1));
++                sscenc_ec_icdf(enc, 2 * qi ^ -(qi < 0), small_energy_icdf, 2);
++            } else if (budget - tell >= 1) {
++                qi = sscenc_imin(0, qi);
++                sscenc_ec_bit_logp(enc, -qi, 1);
++            } else {
++                qi = -1;
++            }
++            error[k] = (int16_t)(((f + 64) >> 7) - (qi << SSCE_DB_SHIFT));
++            badness += abs(qi0 - qi);
++            q = (int32_t)((uint32_t)qi << SSCE_DB_SHIFT);
++            tmp = ((coef * oldc + 128) >> 8) + prev[c] + (int32_t)((uint32_t)q << 7);
++            if (tmp < -(28 << (SSCE_DB_SHIFT + 7))) tmp = -(28 << (SSCE_DB_SHIFT + 7));
++            oldE[k] = (int16_t)((tmp + 64) >> 7);
++            prev[c] = prev[c] + (int32_t)((uint32_t)q << 7) - beta * ((q + 128) >> 8);
++        }
++    }
++    return badness;
++}
++
++/* Two-pass coarse quantisation: tries intra and inter prediction and keeps the cheaper one (fewer
++ * clamped deltas first, then fewer bits). Returns the intra flag that was coded. */
++int sscenc_quant_coarse_energy(int end, const int16_t *x, int16_t *oldE, int32_t budget, int nbAvailableBytes,
++                               int16_t *error, sscenc_ec *enc) {
++    int16_t old_intra[SSCE_C * SSCE_NB], err_intra[SSCE_C * SSCE_NB];
++    unsigned char intra_bytes[1300];
++    sscenc_ec start = *enc, after_intra;
++    int32_t max_decay = Q10(16);
++    int badness1, badness2, two_pass = 1;
++    uint32_t tell_intra, nstart, nintra;
++
++    if (sscenc_ec_tell(enc) + 3 > budget) two_pass = 0;
++    if (end > 10 && ((int32_t)nbAvailableBytes << (SSCE_DB_SHIFT - 3)) < max_decay)
++        max_decay = (int32_t)nbAvailableBytes << (SSCE_DB_SHIFT - 3);
++
++    if (!two_pass) {
++        coarse_pass(end, x, oldE, budget, 0, max_decay, error, enc);
++        return 0;
++    }
++    memcpy(old_intra, oldE, sizeof old_intra);
++    badness1 = coarse_pass(end, x, old_intra, budget, 1, max_decay, err_intra, enc);
++    tell_intra = sscenc_ec_tell_frac(enc);
++    after_intra = *enc;
++    /* The range coder only writes bytes forward from offs; keep the ones the intra pass produced. */
++    nstart = start.offs;
++    nintra = after_intra.offs;
++    if (nintra - nstart > sizeof intra_bytes) nintra = nstart + (uint32_t)sizeof intra_bytes; /* not reachable */
++    memcpy(intra_bytes, enc->buf + nstart, nintra - nstart);
++    *enc = start;
++    badness2 = coarse_pass(end, x, oldE, budget, 0, max_decay, error, enc);
++    if (badness1 < badness2 || (badness1 == badness2 && sscenc_ec_tell_frac(enc) > tell_intra)) {
++        *enc = after_intra;
++        memcpy(enc->buf + nstart, intra_bytes, nintra - nstart);
++        memcpy(oldE, old_intra, sizeof old_intra);
++        memcpy(error, err_intra, sizeof err_intra);
++        return 1;
++    }
++    return 0;
++}
++
++void sscenc_quant_fine_energy(int end, int16_t *oldE, int16_t *error, const int *fine_quant, sscenc_ec *enc) {
++    int i, c;
++    for (i = 0; i < end; i++) {
++        const int fq = fine_quant[i];
++        const int frac = 1 << fq;
++        if (fq <= 0) continue;
++        for (c = 0; c < SSCE_C; c++) {
++            const int k = i + c * SSCE_NB;
++            int q2 = (error[k] + (1 << (SSCE_DB_SHIFT - 1))) >> (SSCE_DB_SHIFT - fq);
++            int16_t offset;
++            if (q2 > frac - 1) q2 = frac - 1;
++            if (q2 < 0) q2 = 0;
++            sscenc_ec_bits(enc, (uint32_t)q2, (unsigned)fq);
++            offset = (int16_t)(((((int32_t)q2 << SSCE_DB_SHIFT) + (1 << (SSCE_DB_SHIFT - 1))) >> fq) -
++                               (1 << (SSCE_DB_SHIFT - 1)));
++            oldE[k] = (int16_t)(oldE[k] + offset);
++            error[k] = (int16_t)(error[k] - offset);
++        }
++    }
++}
++
++void sscenc_quant_energy_finalise(int end, int16_t *oldE, int16_t *error, const int *fine_quant,
++                                  const int *fine_priority, int bits_left, sscenc_ec *enc) {
++    int i, prio, c;
++    for (prio = 0; prio < 2; prio++) {
++        for (i = 0; i < end && bits_left >= SSCE_C; i++) {
++            if (fine_quant[i] >= SSCE_MAX_FINE || fine_priority[i] != prio) continue;
++            for (c = 0; c < SSCE_C; c++) {
++                const int k = i + c * SSCE_NB;
++                int q2 = error[k] < 0 ? 0 : 1;
++                int16_t offset;
++                sscenc_ec_bits(enc, (uint32_t)q2, 1);
++                offset = (int16_t)((((int32_t)q2 << SSCE_DB_SHIFT) - (1 << (SSCE_DB_SHIFT - 1))) >>
++                                   (fine_quant[i] + 1));
++                oldE[k] = (int16_t)(oldE[k] + offset);
++                error[k] = (int16_t)(error[k] - offset);
++                bits_left--;
++            }
++        }
++    }
++}
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_internal.h b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_internal.h
+new file mode 100644
+index 0000000..ba0c20e
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_internal.h
+@@ -0,0 +1,147 @@
++/* SSC encoder: internal declarations shared between the modules.
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ * Parts are adapted from libopus 1.1 (CELT), Copyright Xiph.Org Foundation and contributors,
++ * BSD-3-Clause; their notice is reproduced in LICENSE.
++ *
++ * Conventions: every symbol of the library outside the public API starts with "sscenc_", so the
++ * encoder can be linked into the same program as an SSC decoder or as libopus.
++ * Band energies live in two forms:
++ *   - float log2 amplitude (1.0 = 6.02 dB) relative to eMeans, used by the analysis code;
++ *   - int16 Q10 (DB_SHIFT = 10), the exact integer state that the decoder also keeps. Everything
++ *     that influences the bitstream syntax uses the integer form and integer arithmetic. */
++#ifndef SSC_ENC_INTERNAL_H
++#define SSC_ENC_INTERNAL_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#define SSCE_N          864  /* samples per channel per frame = long MDCT coefficient count */
++#define SSCE_OVERLAP    108  /* window overlap, also the short MDCT size */
++#define SSCE_SHORT      108
++#define SSCE_M          8    /* short blocks per frame (1 << LM) */
++#define SSCE_LM         3
++#define SSCE_C          2    /* the bitstream always codes two channels */
++#define SSCE_NB         22   /* bands */
++#define SSCE_BITRES     3
++#define SSCE_DB_SHIFT   10
++#define SSCE_MAX_FINE   8
++#define SSCE_MAX_BAND_N 144  /* widest band: 18 * 8 bins */
++
++#define SSCE_SPREAD_NONE       0
++#define SSCE_SPREAD_LIGHT      1
++#define SSCE_SPREAD_NORMAL     2
++#define SSCE_SPREAD_AGGRESSIVE 3
++
++static inline int sscenc_imin(int a, int b) { return a < b ? a : b; }
++static inline int sscenc_imax(int a, int b) { return a > b ? a : b; }
++static inline int sscenc_ilog(uint32_t v) {
++    int r = 0;
++    while (v) { r++; v >>= 1; }
++    return r;
++}
++
++/* ---- range encoder (opus 1.1 entenc.c with a 24-bit coder, ssc_enc_ec.c) ---- */
++typedef struct {
++    unsigned char *buf;
++    uint32_t storage;
++    uint32_t end_offs;
++    uint32_t end_window;
++    int nend_bits;
++    int nbits_total;
++    uint32_t offs;
++    uint32_t rng;
++    uint32_t val;
++    uint32_t ext;
++    int rem;
++    int error;
++} sscenc_ec;
++
++void sscenc_ec_init(sscenc_ec *e, unsigned char *buf, uint32_t size);
++int sscenc_ec_tell(const sscenc_ec *e);
++uint32_t sscenc_ec_tell_frac(const sscenc_ec *e);
++void sscenc_ec_encode(sscenc_ec *e, unsigned fl, unsigned fh, unsigned ft);
++void sscenc_ec_encode_bin(sscenc_ec *e, unsigned fl, unsigned fh, unsigned bits);
++void sscenc_ec_bit_logp(sscenc_ec *e, int val, unsigned logp);
++void sscenc_ec_icdf(sscenc_ec *e, int s, const unsigned char *icdf, unsigned ftb);
++void sscenc_ec_uint(sscenc_ec *e, uint32_t fl, uint32_t ft);
++void sscenc_ec_bits(sscenc_ec *e, uint32_t fl, unsigned bits);
++void sscenc_ec_done(sscenc_ec *e);
++void sscenc_laplace_encode(sscenc_ec *e, int *value, unsigned fs, int decay);
++
++/* ---- mode tables (ssc_enc_tables.c) ---- */
++typedef struct {
++    const short *eBands;                  /* 23 entries, in units of 8 MDCT bins */
++    const unsigned char *allocVectors[2]; /* [0]: bitrate <= 192000, [1]: bitrate > 192000 */
++    const short *logN;                    /* 22 */
++    const short *cache_index;             /* 5 x 22, row = LM + 1 */
++    const unsigned char *cache_bits;
++    const int *cap;                       /* 22, per-band cap in 1/8 bits (C=2, LM=3) */
++} sscenc_mode;
++
++extern const sscenc_mode sscenc_mode_44k;
++extern const sscenc_mode sscenc_mode_96k;
++extern const float sscenc_window[SSCE_OVERLAP];
++extern const float sscenc_eMeans[25];
++extern const unsigned char sscenc_log2_frac[24];
++extern const unsigned char sscenc_e_prob_model[2][42]; /* [0] inter, [1] intra (LM = 3) */
++extern const uint32_t *const sscenc_pvq_u_row[15];
++
++/* ---- forward MDCT (ssc_enc_mdct.c) ---- */
++typedef struct { float r, i; } sscenc_cpx;
++typedef struct {
++    sscenc_cpx tw_long[432], tw_short[54];   /* exp(-2 pi i k / n) */
++    sscenc_cpx pre_long[432], post_long[432];
++    sscenc_cpx pre_short[54], post_short[54];
++    float win_long[2 * SSCE_N];               /* 1728-point window of the long block */
++    float win_short[2 * SSCE_SHORT];
++} sscenc_mdct;
++
++void sscenc_mdct_init(sscenc_mdct *m);
++/* in: SSCE_N + SSCE_OVERLAP samples (108 old + 864 new). out: 864 coefficients in 16-bit PCM units,
++ * either one long block or 8 interleaved short blocks (out[j*8+b]). */
++void sscenc_mdct_frame(const sscenc_mdct *m, const float *in, int shortBlocks, float *out);
++
++/* ---- energy quantisation (ssc_enc_energy.c), Q10 integers ---- */
++int sscenc_quant_coarse_energy(int end, const int16_t *x, int16_t *oldE, int32_t budget, int nbAvailableBytes,
++                               int16_t *error, sscenc_ec *enc);
++void sscenc_quant_fine_energy(int end, int16_t *oldE, int16_t *error, const int *fine_quant, sscenc_ec *enc);
++void sscenc_quant_energy_finalise(int end, int16_t *oldE, int16_t *error, const int *fine_quant,
++                                  const int *fine_priority, int bits_left, sscenc_ec *enc);
++
++/* ---- bit allocation (ssc_enc_alloc.c) ---- */
++int sscenc_compute_allocation(const sscenc_mode *m, int end, const int *offsets, int alloc_trim, int hi_rate,
++                              int32_t total, int32_t *balance, int *pulses, int *ebits, int *fine_priority,
++                              int *intensity, int *dual_stereo, int prev_coded, int signal_bw, sscenc_ec *ec);
++
++/* ---- band shapes (ssc_enc_bands.c) ---- */
++void sscenc_quant_all_bands(const sscenc_mode *m, int end, float *X, float *Y, const float *bandE,
++                            const int *pulses, int shortBlocks, int spread, int dual_stereo, int intensity,
++                            const int *tf_res, int32_t total_bits, int32_t balance, sscenc_ec *ec, int codedBands);
++void sscenc_haar1(float *X, int N0, int stride);
++float sscenc_cos_half_pi(float x);
++
++/* ---- analysis (ssc_enc_analysis.c) ---- */
++int sscenc_transient_analysis(const float *in, int len, float *tf_estimate, int *tf_chan);
++int sscenc_patch_transient_decision(const float *newE, const float *oldE, int end);
++int sscenc_tf_analysis(const sscenc_mode *m, int len, int isTransient, int *tf_res, int lambda, const float *X,
++                       float tf_estimate, int tf_chan);
++int sscenc_spreading_decision(const sscenc_mode *m, const float *X, int *average, int last_decision, int end);
++void sscenc_dynalloc_analysis(const sscenc_mode *m, const float *bandLogE, const float *bandLogE2, int end,
++                              int *offsets, int lsb_depth, int isTransient, int effectiveBytes);
++int sscenc_alloc_trim_analysis(const sscenc_mode *m, const float *X, const float *bandLogE, int end,
++                               float *stereo_saving, float tf_estimate, int intensity);
++int sscenc_stereo_analysis(const sscenc_mode *m, const float *X);
++
++extern const signed char sscenc_tf_select_table[8];
++
++/* ---- pitch prefilter (ssc_enc_pitch.c) ---- */
++#define SSCE_PF_MINPERIOD 15
++#define SSCE_PF_MAXPERIOD 1024
++void sscenc_pitch_downsample(const float *x0, const float *x1, float *x_lp, int len);
++void sscenc_pitch_search(const float *x_lp, const float *y, int len, int max_pitch, int *pitch);
++float sscenc_remove_doubling(const float *x, int maxperiod, int minperiod, int N, int *T0_, int prev_period,
++                             float prev_gain);
++void sscenc_comb_filter(float *y, const float *x, int T0, int T1, int N, float g0, float g1, int overlap);
++
++#endif
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_mdct.c b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_mdct.c
+new file mode 100644
+index 0000000..fab4fa0
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_mdct.c
+@@ -0,0 +1,167 @@
++/* SSC encoder: forward MDCT (one 1728-point block, or eight 216-point blocks).
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ *
++ * Definition (N2 = number of coefficients, 864 long or 108 short; the block has 2*N2 samples):
++ *     X[k] = 2/N2 * sum_{n=0}^{2*N2-1} w[n] x[n] cos(pi/N2 * (n + 1/2 + N2/2) * (k + 1/2))
++ * which is the exact inverse (with overlap-add) of the SSC synthesis. The long block covers the 972 input
++ * samples [108 previous | 864 new] in the middle of the 1728-sample window: 378 zeros, the rising half of the
++ * 108-sample overlap window, ones, the falling half, 378 zeros. Short block b covers input samples
++ * [108*b, 108*b + 216) with the rising and falling overlap halves.
++ *
++ * The MDCT is folded into an N2-point DCT-IV, computed with an N2/2-point complex FFT
++ * (432 = 4*4*3*3*3, 54 = 2*3*3*3). */
++#include <math.h>
++#include <string.h>
++
++#include "ssc_enc_internal.h"
++
++#define PI_D 3.14159265358979323846
++
++static const int factors_432[] = {4, 108, 4, 27, 3, 9, 3, 3, 3, 1}; /* (radix, remaining length) */
++static const int factors_54[] = {2, 27, 3, 9, 3, 3, 3, 1};
++
++static void fill_tw(sscenc_cpx *tw, int n) {
++    int k;
++    for (k = 0; k < n; k++) {
++        tw[k].r = (float)cos(-2.0 * PI_D * k / n);
++        tw[k].i = (float)sin(-2.0 * PI_D * k / n);
++    }
++}
++
++/* DCT-IV of size N2 via an M = N2/2 point FFT:
++ *   z[n] = (v[2n] + i v[N2-1-2n]) * exp(-i pi n / N2)
++ *   S[k] = FFT_M(z)[k] * exp(-i pi (k + 1/4) / N2)
++ *   u[2k] = Re S[k],  u[N2-1-2k] = -Im S[k]
++ * The pre/post twiddles also carry the 2/N2 MDCT scale. */
++static void fill_prepost(sscenc_cpx *pre, sscenc_cpx *post, int n2) {
++    int k, m = n2 / 2;
++    double scale = 2.0 / n2;
++    for (k = 0; k < m; k++) {
++        pre[k].r = (float)cos(-PI_D * k / n2);
++        pre[k].i = (float)sin(-PI_D * k / n2);
++        post[k].r = (float)(scale * cos(-PI_D * (k + 0.25) / n2));
++        post[k].i = (float)(scale * sin(-PI_D * (k + 0.25) / n2));
++    }
++}
++
++void sscenc_mdct_init(sscenc_mdct *m) {
++    int i;
++    fill_tw(m->tw_long, 432);
++    fill_tw(m->tw_short, 54);
++    fill_prepost(m->pre_long, m->post_long, SSCE_N);
++    fill_prepost(m->pre_short, m->post_short, SSCE_SHORT);
++    /* long window: 378 zeros, rise, ones, fall, 378 zeros */
++    for (i = 0; i < 2 * SSCE_N; i++) {
++        int n = i - 378;
++        float w;
++        if (n < 0 || n >= SSCE_N + SSCE_OVERLAP) w = 0.f;
++        else if (n < SSCE_OVERLAP) w = sscenc_window[n];
++        else if (n < SSCE_N) w = 1.f;
++        else w = sscenc_window[SSCE_N + SSCE_OVERLAP - 1 - n];
++        m->win_long[i] = w;
++    }
++    for (i = 0; i < SSCE_OVERLAP; i++) {
++        m->win_short[i] = sscenc_window[i];
++        m->win_short[SSCE_OVERLAP + i] = sscenc_window[SSCE_OVERLAP - 1 - i];
++    }
++}
++
++#define CMUL(o, a, b)                                                                                      \
++    do {                                                                                                   \
++        float ar_ = (a).r, ai_ = (a).i;                                                                    \
++        (o).r = ar_ * (b).r - ai_ * (b).i;                                                                 \
++        (o).i = ar_ * (b).i + ai_ * (b).r;                                                                 \
++    } while (0)
++
++/* Recursive decimation-in-time mixed-radix DFT: out[k] = sum_n in[n*in_stride] exp(-2 pi i n k / N). */
++static void fft_rec(sscenc_cpx *out, const sscenc_cpx *in, int fstride, const int *factors, const sscenc_cpx *tw) {
++    const int p = factors[0], m = factors[1];
++    int k, q;
++    if (m == 1) {
++        for (q = 0; q < p; q++) out[q] = in[q * fstride];
++    } else {
++        for (q = 0; q < p; q++) fft_rec(out + q * m, in + q * fstride, fstride * p, factors + 2, tw);
++    }
++    if (p == 4) {
++        sscenc_cpx *F = out;
++        for (k = 0; k < m; k++, F++) {
++            sscenc_cpx s0, s1, s2, s3, s4, s5;
++            CMUL(s0, F[m], tw[k * fstride]);
++            CMUL(s1, F[2 * m], tw[2 * k * fstride]);
++            CMUL(s2, F[3 * m], tw[3 * k * fstride]);
++            s5.r = F[0].r - s1.r; s5.i = F[0].i - s1.i;
++            F[0].r += s1.r; F[0].i += s1.i;
++            s3.r = s0.r + s2.r; s3.i = s0.i + s2.i;
++            s4.r = s0.r - s2.r; s4.i = s0.i - s2.i;
++            F[2 * m].r = F[0].r - s3.r; F[2 * m].i = F[0].i - s3.i;
++            F[0].r += s3.r; F[0].i += s3.i;
++            F[m].r = s5.r + s4.i; F[m].i = s5.i - s4.r;
++            F[3 * m].r = s5.r - s4.i; F[3 * m].i = s5.i + s4.r;
++        }
++    } else if (p == 3) {
++        const float epi3_i = tw[m * fstride].i; /* -sin(2 pi / 3) */
++        sscenc_cpx *F = out;
++        for (k = 0; k < m; k++, F++) {
++            sscenc_cpx s0, s1, s2, s3;
++            CMUL(s1, F[m], tw[k * fstride]);
++            CMUL(s2, F[2 * m], tw[2 * k * fstride]);
++            s3.r = s1.r + s2.r; s3.i = s1.i + s2.i;
++            s0.r = (s1.r - s2.r) * epi3_i; s0.i = (s1.i - s2.i) * epi3_i;
++            F[m].r = F[0].r - 0.5f * s3.r; F[m].i = F[0].i - 0.5f * s3.i;
++            F[0].r += s3.r; F[0].i += s3.i;
++            F[2 * m].r = F[m].r + s0.i; F[2 * m].i = F[m].i - s0.r;
++            F[m].r -= s0.i; F[m].i += s0.r;
++        }
++    } else { /* p == 2 */
++        sscenc_cpx *F = out;
++        for (k = 0; k < m; k++, F++) {
++            sscenc_cpx t;
++            CMUL(t, F[m], tw[k * fstride]);
++            F[m].r = F[0].r - t.r; F[m].i = F[0].i - t.i;
++            F[0].r += t.r; F[0].i += t.i;
++        }
++    }
++}
++
++/* One MDCT block. x: 2*n2 samples (unwindowed), win: 2*n2 window. Output with stride. */
++static void mdct_block(const sscenc_mdct *m, const float *x, const float *win, int n2, float *out, int stride) {
++    sscenc_cpx z[432], Z[432];
++    float xw[2 * SSCE_N], v[SSCE_N];
++    const int q = n2 / 2, half = n2 / 2;
++    const sscenc_cpx *pre = n2 == SSCE_N ? m->pre_long : m->pre_short;
++    const sscenc_cpx *post = n2 == SSCE_N ? m->post_long : m->post_short;
++    int j, k;
++    for (j = 0; j < 2 * n2; j++) xw[j] = x[j] * win[j];
++    /* fold the 2*n2 windowed samples into the n2-point DCT-IV input */
++    for (j = 0; j < q; j++) v[j] = -xw[3 * q - 1 - j] - xw[j + 3 * q];
++    for (j = q; j < n2; j++) v[j] = xw[j - q] - xw[3 * q - 1 - j];
++    for (k = 0; k < half; k++) {
++        sscenc_cpx t;
++        t.r = v[2 * k];
++        t.i = v[n2 - 1 - 2 * k];
++        CMUL(z[k], t, pre[k]);
++    }
++    if (n2 == SSCE_N) fft_rec(Z, z, 1, factors_432, m->tw_long);
++    else fft_rec(Z, z, 1, factors_54, m->tw_short);
++    for (k = 0; k < half; k++) {
++        sscenc_cpx s;
++        CMUL(s, Z[k], post[k]);
++        out[(2 * k) * stride] = s.r;
++        out[(n2 - 1 - 2 * k) * stride] = -s.i;
++    }
++}
++
++void sscenc_mdct_frame(const sscenc_mdct *m, const float *in, int shortBlocks, float *out) {
++    if (!shortBlocks) {
++        /* Long block: the 972 input samples start at offset 378 of the 1728-point block. Only the windowed
++         * part is non-zero, so build the block from in[] with zero padding. */
++        float x[2 * SSCE_N];
++        memset(x, 0, sizeof x);
++        memcpy(x + 378, in, sizeof(float) * (SSCE_N + SSCE_OVERLAP));
++        mdct_block(m, x, m->win_long, SSCE_N, out, 1);
++    } else {
++        int b;
++        for (b = 0; b < SSCE_M; b++) mdct_block(m, in + SSCE_SHORT * b, m->win_short, SSCE_SHORT, out + b, SSCE_M);
++    }
++}
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_pitch.c b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_pitch.c
+new file mode 100644
+index 0000000..c9611cd
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_pitch.c
+@@ -0,0 +1,252 @@
++/* SSC encoder: pitch analysis and the comb prefilter (the decoder runs the inverse postfilter).
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ * Adapted from libopus 1.1 celt/pitch.c, celt/celt_lpc.c and celt/celt.c, float build
++ * (Copyright 2007-2009 Xiph.Org Foundation, 2007-2008 CSIRO, BSD-3-Clause, see LICENSE).
++ *
++ * SSC has no tapset symbol: the filter always uses CELT tapset 0. */
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "ssc_enc_internal.h"
++
++static const float comb_gains[3] = {0.3066406250f, 0.2170410156f, 0.1296386719f};
++
++static void celt_lpc(float *lpc, const float *ac, int p) {
++    int i, j;
++    float error = ac[0];
++    for (i = 0; i < p; i++) lpc[i] = 0;
++    if (ac[0] == 0) return;
++    for (i = 0; i < p; i++) {
++        float rr = 0, r;
++        for (j = 0; j < i; j++) rr += lpc[j] * ac[i - j];
++        rr += ac[i + 1];
++        r = -rr / error;
++        lpc[i] = r;
++        for (j = 0; j < (i + 1) >> 1; j++) {
++            float t1 = lpc[j], t2 = lpc[i - 1 - j];
++            lpc[j] = t1 + r * t2;
++            lpc[i - 1 - j] = t2 + r * t1;
++        }
++        error = error - r * r * error;
++        if (error < .001f * ac[0]) break; /* 30 dB prediction gain is enough */
++    }
++}
++
++/* Low-pass and decimate by 2, sum of the channels, then a 4th-order LPC whitening (with an extra zero). */
++void sscenc_pitch_downsample(const float *x0, const float *x1, float *x_lp, int len) {
++    float ac[5], lpc[4], lpc2[5], mem[5] = {0, 0, 0, 0, 0}, tmp = 1.f;
++    const float c1 = .8f;
++    int i, k;
++    for (i = 1; i < len >> 1; i++)
++        x_lp[i] = .5f * (.5f * (x0[2 * i - 1] + x0[2 * i + 1]) + x0[2 * i]) +
++                  .5f * (.5f * (x1[2 * i - 1] + x1[2 * i + 1]) + x1[2 * i]);
++    x_lp[0] = .5f * (.5f * x0[1] + x0[0]) + .5f * (.5f * x1[1] + x1[0]);
++    for (k = 0; k <= 4; k++) {
++        double s = 0;
++        for (i = k; i < len >> 1; i++) s += (double)x_lp[i] * x_lp[i - k];
++        ac[k] = (float)s;
++    }
++    ac[0] *= 1.0001f; /* noise floor -40 dB */
++    for (i = 1; i <= 4; i++) ac[i] -= ac[i] * (.008f * i) * (.008f * i); /* lag window */
++    celt_lpc(lpc, ac, 4);
++    for (i = 0; i < 4; i++) {
++        tmp *= .9f;
++        lpc[i] *= tmp;
++    }
++    lpc2[0] = lpc[0] + .8f;
++    lpc2[1] = lpc[1] + c1 * lpc[0];
++    lpc2[2] = lpc[2] + c1 * lpc[1];
++    lpc2[3] = lpc[3] + c1 * lpc[2];
++    lpc2[4] = c1 * lpc[3];
++    for (i = 0; i < len >> 1; i++) {
++        float x = x_lp[i];
++        float sum = x + lpc2[0] * mem[0] + lpc2[1] * mem[1] + lpc2[2] * mem[2] + lpc2[3] * mem[3] + lpc2[4] * mem[4];
++        mem[4] = mem[3];
++        mem[3] = mem[2];
++        mem[2] = mem[1];
++        mem[1] = mem[0];
++        mem[0] = x;
++        x_lp[i] = sum;
++    }
++}
++
++static void find_best_pitch(const float *xcorr, const float *y, int len, int max_pitch, int *best_pitch) {
++    int i, j;
++    float Syy = 1, best_num[2] = {-1, -1}, best_den[2] = {0, 0};
++    best_pitch[0] = 0;
++    best_pitch[1] = 1;
++    for (j = 0; j < len; j++) Syy += y[j] * y[j];
++    for (i = 0; i < max_pitch; i++) {
++        if (xcorr[i] > 0) {
++            float xc = xcorr[i] * 1e-12f, num = xc * xc;
++            if (num * best_den[1] > best_num[1] * Syy) {
++                if (num * best_den[0] > best_num[0] * Syy) {
++                    best_num[1] = best_num[0];
++                    best_den[1] = best_den[0];
++                    best_pitch[1] = best_pitch[0];
++                    best_num[0] = num;
++                    best_den[0] = Syy;
++                    best_pitch[0] = i;
++                } else {
++                    best_num[1] = num;
++                    best_den[1] = Syy;
++                    best_pitch[1] = i;
++                }
++            }
++        }
++        Syy += y[i + len] * y[i + len] - y[i] * y[i];
++        if (Syy < 1) Syy = 1;
++    }
++}
++
++#define MAX_PITCH_LAG 1024
++
++/* Open-loop pitch search on the decimated signal: coarse at 4x decimation, refined at 2x. */
++void sscenc_pitch_search(const float *x_lp, const float *y, int len, int max_pitch, int *pitch) {
++    float x_lp4[SSCE_N / 4 + 1], y_lp4[(SSCE_N + MAX_PITCH_LAG) / 4 + 1], xcorr[MAX_PITCH_LAG / 2];
++    int i, j, lag = len + max_pitch, best_pitch[2] = {0, 0}, offset;
++    for (j = 0; j < len >> 2; j++) x_lp4[j] = x_lp[2 * j];
++    for (j = 0; j < lag >> 2; j++) y_lp4[j] = y[2 * j];
++    for (i = 0; i < max_pitch >> 2; i++) {
++        float s = 0;
++        for (j = 0; j < len >> 2; j++) s += x_lp4[j] * y_lp4[i + j];
++        xcorr[i] = s;
++    }
++    find_best_pitch(xcorr, y_lp4, len >> 2, max_pitch >> 2, best_pitch);
++    for (i = 0; i < max_pitch >> 1; i++) {
++        float s = 0;
++        xcorr[i] = 0;
++        if (abs(i - 2 * best_pitch[0]) > 2 && abs(i - 2 * best_pitch[1]) > 2) continue;
++        for (j = 0; j < len >> 1; j++) s += x_lp[j] * y[i + j];
++        xcorr[i] = s > -1 ? s : -1;
++    }
++    find_best_pitch(xcorr, y, len >> 1, max_pitch >> 1, best_pitch);
++    offset = 0;
++    if (best_pitch[0] > 0 && best_pitch[0] < (max_pitch >> 1) - 1) {
++        float a = xcorr[best_pitch[0] - 1], b = xcorr[best_pitch[0]], c = xcorr[best_pitch[0] + 1];
++        if ((c - a) > .7f * (b - a)) offset = 1;
++        else if ((a - c) > .7f * (b - c)) offset = -1;
++    }
++    *pitch = 2 * best_pitch[0] - offset;
++}
++
++/* Checks the sub-multiples of the period (octave errors) and returns the pitch gain. x: decimated signal,
++ * maxperiod/2 history samples followed by N/2 samples. */
++float sscenc_remove_doubling(const float *x, int maxperiod, int minperiod, int N, int *T0_, int prev_period,
++                             float prev_gain) {
++    static const int second_check[16] = {0, 0, 3, 2, 3, 2, 5, 2, 3, 2, 3, 2, 5, 2, 3, 2};
++    float yy_lookup[MAX_PITCH_LAG / 2 + 1], xcorr[3];
++    float xx = 0, xy = 0, yy, xy2, g, g0, pg, best_xy, best_yy;
++    int k, i, T, T0, offset, minperiod0 = minperiod;
++    maxperiod /= 2;
++    minperiod /= 2;
++    *T0_ /= 2;
++    prev_period /= 2;
++    N /= 2;
++    x += maxperiod;
++    if (*T0_ >= maxperiod) *T0_ = maxperiod - 1;
++    T = T0 = *T0_;
++    for (i = 0; i < N; i++) {
++        xx += x[i] * x[i];
++        xy += x[i] * x[i - T0];
++    }
++    yy_lookup[0] = xx;
++    yy = xx;
++    for (i = 1; i <= maxperiod; i++) {
++        yy = yy + x[-i] * x[-i] - x[N - i] * x[N - i];
++        yy_lookup[i] = yy > 0 ? yy : 0;
++    }
++    yy = yy_lookup[T0];
++    best_xy = xy;
++    best_yy = yy;
++    g = g0 = xy / sqrtf(1 + xx * yy);
++    for (k = 2; k <= 15; k++) {
++        int T1, T1b;
++        float g1, cont, thresh;
++        T1 = (2 * T0 + k) / (2 * k);
++        if (T1 < minperiod) break;
++        if (k == 2) T1b = T1 + T0 > maxperiod ? T0 : T0 + T1;
++        else T1b = (2 * second_check[k] * T0 + k) / (2 * k);
++        xy = 0;
++        xy2 = 0;
++        for (i = 0; i < N; i++) {
++            xy += x[i] * x[i - T1];
++            xy2 += x[i] * x[i - T1b];
++        }
++        xy += xy2;
++        yy = yy_lookup[T1] + yy_lookup[T1b];
++        g1 = xy / sqrtf(1 + 2.f * xx * yy);
++        if (abs(T1 - prev_period) <= 1) cont = prev_gain;
++        else if (abs(T1 - prev_period) <= 2 && 5 * k * k < T0) cont = .5f * prev_gain;
++        else cont = 0;
++        thresh = .7f * g0 - cont;
++        if (thresh < .3f) thresh = .3f;
++        if (T1 < 3 * minperiod) {
++            thresh = .85f * g0 - cont;
++            if (thresh < .4f) thresh = .4f;
++        } else if (T1 < 2 * minperiod) {
++            thresh = .9f * g0 - cont;
++            if (thresh < .5f) thresh = .5f;
++        }
++        if (g1 > thresh) {
++            best_xy = xy;
++            best_yy = yy;
++            T = T1;
++            g = g1;
++        }
++    }
++    if (best_xy < 0) best_xy = 0;
++    pg = best_yy <= best_xy ? 1.f : best_xy / (best_yy + 1);
++    for (k = 0; k < 3; k++) {
++        int T1 = T + k - 1;
++        float s = 0;
++        for (i = 0; i < N; i++) s += x[i] * x[i - T1];
++        xcorr[k] = s;
++    }
++    if ((xcorr[2] - xcorr[0]) > .7f * (xcorr[1] - xcorr[0])) offset = 1;
++    else if ((xcorr[0] - xcorr[2]) > .7f * (xcorr[1] - xcorr[2])) offset = -1;
++    else offset = 0;
++    if (pg > g) pg = g;
++    *T0_ = 2 * T + offset;
++    if (*T0_ < minperiod0) *T0_ = minperiod0;
++    return pg;
++}
++
++/* y[i] = x[i] + g * (3-tap comb at period T), crossfading from (T0, g0) to (T1, g1) over the first `overlap`
++ * samples with the squared window. x needs T + 2 samples of history. y and x must not overlap. The encoder
++ * calls it with negative gains (FIR prefilter); the decoder runs the IIR inverse with positive gains. */
++void sscenc_comb_filter(float *y, const float *x, int T0, int T1, int N, float g0, float g1, int overlap) {
++    float g00 = g0 * comb_gains[0], g01 = g0 * comb_gains[1], g02 = g0 * comb_gains[2];
++    float g10 = g1 * comb_gains[0], g11 = g1 * comb_gains[1], g12 = g1 * comb_gains[2];
++    float x0, x1, x2, x3, x4;
++    int i;
++    if (g0 == 0 && g1 == 0) {
++        memmove(y, x, sizeof(float) * N);
++        return;
++    }
++    x1 = x[-T1 + 1];
++    x2 = x[-T1];
++    x3 = x[-T1 - 1];
++    x4 = x[-T1 - 2];
++    for (i = 0; i < overlap; i++) {
++        float f = sscenc_window[i] * sscenc_window[i];
++        x0 = x[i - T1 + 2];
++        y[i] = x[i] + (1.f - f) * g00 * x[i - T0] + (1.f - f) * g01 * (x[i - T0 + 1] + x[i - T0 - 1]) +
++               (1.f - f) * g02 * (x[i - T0 + 2] + x[i - T0 - 2]) + f * g10 * x2 + f * g11 * (x1 + x3) +
++               f * g12 * (x0 + x4);
++        x4 = x3;
++        x3 = x2;
++        x2 = x1;
++        x1 = x0;
++    }
++    for (; i < N; i++) {
++        x0 = x[i - T1 + 2];
++        y[i] = x[i] + g10 * x2 + g11 * (x1 + x3) + g12 * (x0 + x4);
++        x4 = x3;
++        x3 = x2;
++        x2 = x1;
++        x1 = x0;
++    }
++}
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_tables.c b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_tables.c
+new file mode 100644
+index 0000000..f7373f1
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_enc_tables.c
+@@ -0,0 +1,342 @@
++/* SSC encoder: mode tables.
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ * These are the parameters of the two SSC codec modes (band layout, allocation vectors, pulse cache, caps).
++ * They are data required for bitstream interoperability. The CELT-derived tables (eMeans, the Laplace
++ * models, LOG2_FRAC_TABLE, the PVQ codebook-size table) come from libopus 1.1, Copyright Xiph.Org Foundation
++ * and contributors, BSD-3-Clause, see LICENSE. */
++#include "ssc_enc_internal.h"
++
++static const short eBands_44k[23] = {
++    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 34, 40, 48, 60, 72, 84, 102,
++};
++static const unsigned char allocA_44k[242] = {
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    118, 110, 103, 93, 86, 79, 74, 69, 65, 58, 52, 46, 43, 35, 26, 18, 6, 1, 0, 0, 0, 0,
++    126, 119, 112, 103, 95, 88, 82, 77, 72, 65, 59, 53, 50, 42, 35, 27, 19, 13, 2, 0, 0, 0,
++    134, 127, 120, 113, 103, 96, 90, 84, 78, 71, 65, 60, 57, 50, 43, 37, 30, 24, 17, 10, 4, 0,
++    144, 137, 130, 123, 113, 106, 100, 94, 88, 81, 75, 70, 67, 60, 53, 47, 40, 34, 27, 16, 6, 0,
++    152, 145, 138, 131, 123, 116, 110, 104, 98, 91, 85, 80, 77, 70, 63, 57, 50, 44, 37, 21, 8, 0,
++    162, 155, 148, 141, 133, 126, 120, 114, 111, 108, 101, 95, 90, 87, 80, 73, 67, 60, 54, 47, 11, 0,
++    172, 165, 158, 151, 143, 136, 130, 124, 121, 118, 111, 105, 100, 97, 96, 95, 90, 80, 70, 60, 20, 0,
++    177, 170, 163, 156, 148, 141, 135, 129, 128, 125, 118, 112, 110, 107, 116, 105, 100, 87, 75, 65, 23, 0,
++    182, 180, 173, 166, 158, 151, 145, 139, 138, 135, 132, 130, 130, 130, 130, 128, 120, 110, 98, 85, 28, 0,
++    200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 196, 192, 188, 184, 180, 175, 160, 145, 113, 1,
++};
++static const unsigned char allocB_44k[242] = {
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    118, 110, 103, 93, 86, 79, 74, 69, 65, 58, 52, 46, 43, 35, 26, 18, 6, 1, 0, 0, 0, 0,
++    126, 119, 112, 103, 95, 88, 82, 77, 72, 65, 59, 53, 50, 42, 35, 27, 19, 13, 2, 0, 0, 0,
++    134, 127, 120, 113, 103, 96, 90, 84, 78, 71, 65, 60, 57, 50, 43, 37, 30, 24, 17, 10, 4, 0,
++    144, 137, 130, 123, 113, 106, 100, 94, 88, 81, 75, 70, 67, 60, 53, 47, 40, 34, 27, 16, 6, 0,
++    152, 145, 138, 131, 123, 116, 110, 104, 98, 91, 85, 80, 77, 70, 63, 57, 50, 44, 37, 21, 8, 0,
++    162, 155, 148, 141, 133, 126, 120, 114, 111, 108, 101, 95, 90, 87, 80, 73, 67, 60, 54, 47, 11, 0,
++    172, 165, 158, 151, 143, 136, 130, 124, 121, 118, 111, 105, 100, 97, 96, 95, 90, 80, 70, 60, 20, 0,
++    177, 170, 163, 156, 148, 141, 135, 129, 128, 125, 118, 112, 110, 107, 106, 105, 100, 87, 75, 65, 21, 0,
++    180, 173, 166, 160, 152, 148, 142, 140, 138, 135, 132, 130, 130, 130, 130, 128, 124, 115, 108, 93, 29, 0,
++    200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 196, 192, 188, 184, 180, 175, 160, 145, 100, 1,
++};
++static const short logN_44k[22] = {
++    0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 16, 16, 16, 21, 21, 24, 29, 29, 29, 34,
++};
++static const short cache_index_44k[110] = {
++    -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 41, 41, 41, 82, 82, 123, 164, 164, 200, 200,
++    0, 0, 0, 0, 0, 0, 0, 0, 41, 41, 41, 41, 123, 123, 123, 164, 164, 222, 248, 248, 265, 265,
++    41, 41, 41, 41, 41, 41, 41, 41, 123, 123, 123, 123, 222, 222, 222, 248, 248, 277, 290, 290, 300, 300,
++    123, 123, 123, 123, 123, 123, 123, 123, 222, 222, 222, 222, 277, 277, 277, 290, 290, 308, 316, 316, 323, 323,
++    222, 222, 222, 222, 222, 222, 222, 222, 277, 277, 277, 277, 308, 308, 308, 316, 316, 329, 335, 335, 341, 341,
++};
++static const unsigned char cache_bits_44k[346] = {
++    40, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
++    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 40, 15, 23, 28, 31, 34, 36,
++    38, 39, 41, 42, 43, 44, 45, 46, 47, 47, 49, 50, 51, 52, 53, 54, 55, 55, 57, 58, 59, 60, 61, 62,
++    63, 63, 65, 66, 67, 68, 69, 70, 71, 71, 40, 20, 33, 41, 48, 53, 57, 61, 64, 66, 69, 71, 73, 75,
++    76, 78, 80, 82, 85, 87, 89, 91, 92, 94, 96, 98, 101, 103, 105, 107, 108, 110, 112, 114, 117, 119, 121, 123,
++    124, 126, 128, 40, 23, 39, 51, 60, 67, 73, 79, 83, 87, 91, 94, 97, 100, 102, 105, 107, 111, 115, 118, 121,
++    124, 126, 129, 131, 135, 139, 142, 145, 148, 150, 153, 155, 159, 163, 166, 169, 172, 174, 177, 179, 35, 28, 49, 65,
++    78, 89, 99, 107, 114, 120, 126, 132, 136, 141, 145, 149, 153, 159, 165, 171, 176, 180, 185, 189, 192, 199, 205, 211,
++    216, 220, 225, 229, 232, 239, 245, 251, 21, 33, 58, 79, 97, 112, 125, 137, 148, 157, 166, 174, 182, 189, 195, 201,
++    207, 217, 227, 235, 243, 251, 25, 31, 55, 75, 91, 105, 117, 128, 138, 146, 154, 161, 168, 174, 180, 185, 190, 200,
++    208, 215, 222, 229, 235, 240, 245, 255, 16, 36, 65, 89, 110, 128, 144, 159, 173, 185, 196, 207, 217, 226, 234, 242,
++    250, 11, 41, 74, 103, 128, 151, 172, 191, 209, 225, 241, 255, 12, 39, 71, 99, 123, 144, 164, 182, 198, 214, 228,
++    241, 253, 9, 44, 81, 113, 142, 168, 192, 214, 235, 255, 7, 49, 90, 127, 160, 191, 220, 247, 7, 47, 87, 123,
++    155, 184, 212, 237, 6, 52, 97, 137, 174, 208, 240, 5, 57, 106, 151, 192, 231, 5, 55, 103, 147, 187, 224, 5,
++    60, 113, 161, 206, 248, 4, 65, 122, 175, 224,
++};
++static const int cap_44k[22] = {
++    1072, 1072, 1072, 1072, 1072, 1072, 1072, 1072, 2120, 2120, 2120, 2120, 4192, 4192, 4192, 6024, 6024, 7648, 9792, 9792, 9792, 9360,
++};
++static const short eBands_96k[23] = {
++    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 20, 24, 30, 36, 54, 72, 90, 108,
++};
++static const unsigned char allocA_96k[242] = {
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    118, 110, 103, 93, 86, 79, 74, 69, 65, 58, 52, 46, 43, 35, 26, 18, 6, 1, 0, 0, 0, 0,
++    126, 119, 112, 103, 95, 88, 82, 77, 72, 65, 59, 53, 50, 42, 35, 27, 19, 13, 2, 0, 0, 0,
++    134, 127, 120, 113, 103, 96, 90, 84, 78, 71, 65, 60, 57, 50, 43, 37, 30, 24, 17, 10, 4, 0,
++    144, 137, 130, 123, 113, 106, 100, 94, 88, 81, 75, 70, 67, 60, 53, 47, 40, 34, 27, 16, 6, 0,
++    152, 145, 138, 131, 123, 116, 110, 104, 98, 91, 85, 80, 77, 70, 63, 57, 50, 44, 37, 21, 8, 0,
++    162, 155, 148, 141, 133, 126, 120, 114, 111, 108, 101, 95, 90, 87, 80, 73, 67, 60, 54, 47, 11, 0,
++    172, 165, 158, 151, 143, 136, 130, 124, 121, 118, 111, 105, 100, 97, 96, 95, 90, 80, 70, 60, 20, 0,
++    177, 170, 163, 156, 148, 141, 135, 129, 128, 125, 118, 112, 110, 107, 116, 105, 100, 87, 75, 65, 23, 0,
++    182, 180, 173, 166, 158, 151, 145, 139, 138, 135, 132, 130, 130, 130, 130, 128, 120, 110, 98, 85, 28, 0,
++    200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 196, 192, 188, 184, 180, 175, 160, 145, 113, 1,
++};
++static const unsigned char allocB_96k[242] = {
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    90, 73, 59, 43, 31, 24, 18, 14, 10, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    110, 88, 74, 60, 48, 41, 34, 29, 26, 23, 19, 15, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    118, 100, 83, 71, 62, 55, 49, 44, 40, 35, 30, 26, 21, 12, 4, 0, 0, 0, 0, 0, 0, 0,
++    126, 110, 92, 79, 69, 62, 56, 51, 47, 43, 38, 34, 30, 23, 17, 8, 0, 0, 0, 0, 0, 0,
++    134, 118, 100, 87, 75, 68, 62, 57, 54, 50, 46, 43, 40, 33, 29, 20, 14, 7, 1, 1, 1, 1,
++    144, 128, 110, 97, 85, 78, 72, 67, 64, 60, 56, 53, 50, 43, 39, 30, 22, 11, 1, 1, 1, 1,
++    152, 136, 120, 107, 95, 88, 82, 77, 74, 70, 66, 63, 60, 53, 49, 40, 31, 10, 1, 1, 1, 1,
++    162, 146, 130, 120, 110, 108, 103, 98, 94, 90, 84, 76, 68, 62, 58, 54, 35, 12, 1, 1, 1, 1,
++    185, 180, 175, 170, 165, 160, 155, 147, 140, 137, 133, 130, 120, 108, 100, 90, 85, 70, 8, 5, 4, 2,
++    200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 190, 45, 30, 25, 10,
++};
++static const short logN_96k[22] = {
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 16, 16, 21, 21, 34, 34, 34, 34,
++};
++static const short cache_index_96k[110] = {
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 41, 41, 82, 82, 123, 123, 123, 123,
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 41, 41, 145, 145, 186, 186, 222, 222, 222, 222,
++    41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 145, 145, 234, 234, 260, 260, 277, 277, 277, 277,
++    145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 234, 234, 285, 285, 298, 298, 308, 308, 308, 308,
++    234, 234, 234, 234, 234, 234, 234, 234, 234, 234, 234, 234, 285, 285, 314, 314, 322, 322, 329, 329, 329, 329,
++};
++static const unsigned char cache_bits_96k[334] = {
++    40, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
++    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 40, 15, 23, 28, 31, 34, 36,
++    38, 39, 41, 42, 43, 44, 45, 46, 47, 47, 49, 50, 51, 52, 53, 54, 55, 55, 57, 58, 59, 60, 61, 62,
++    63, 63, 65, 66, 67, 68, 69, 70, 71, 71, 40, 20, 33, 41, 48, 53, 57, 61, 64, 66, 69, 71, 73, 75,
++    76, 78, 80, 82, 85, 87, 89, 91, 92, 94, 96, 98, 101, 103, 105, 107, 108, 110, 112, 114, 117, 119, 121, 123,
++    124, 126, 128, 21, 33, 58, 79, 97, 112, 125, 137, 148, 157, 166, 174, 182, 189, 195, 201, 207, 217, 227, 235, 243,
++    251, 40, 23, 39, 51, 60, 67, 73, 79, 83, 87, 91, 94, 97, 100, 102, 105, 107, 111, 115, 118, 121, 124, 126,
++    129, 131, 135, 139, 142, 145, 148, 150, 153, 155, 159, 163, 166, 169, 172, 174, 177, 179, 35, 28, 49, 65, 78, 89,
++    99, 107, 114, 120, 126, 132, 136, 141, 145, 149, 153, 159, 165, 171, 176, 180, 185, 189, 192, 199, 205, 211, 216, 220,
++    225, 229, 232, 239, 245, 251, 11, 41, 74, 103, 128, 151, 172, 191, 209, 225, 241, 255, 25, 31, 55, 75, 91, 105,
++    117, 128, 138, 146, 154, 161, 168, 174, 180, 185, 190, 200, 208, 215, 222, 229, 235, 240, 245, 255, 16, 36, 65, 89,
++    110, 128, 144, 159, 173, 185, 196, 207, 217, 226, 234, 242, 250, 7, 49, 90, 127, 160, 191, 220, 247, 12, 39, 71,
++    99, 123, 144, 164, 182, 198, 214, 228, 241, 253, 9, 44, 81, 113, 142, 168, 192, 214, 235, 255, 5, 57, 106, 151,
++    192, 231, 7, 47, 87, 123, 155, 184, 212, 237, 6, 52, 97, 137, 174, 208, 240, 4, 65, 122, 175, 224,
++};
++static const int cap_96k[22] = {
++    1072, 1072, 1072, 1072, 1072, 1072, 1072, 1072, 1072, 1072, 1072, 1072, 2120, 2120, 4192, 4192, 6024, 6024, 9360, 9360, 9360, 9360,
++};
++
++/* Fs 44100 and 48000 share this mode. */
++const sscenc_mode sscenc_mode_44k = {eBands_44k, {allocA_44k, allocB_44k}, logN_44k, cache_index_44k,
++                                     cache_bits_44k, cap_44k};
++const sscenc_mode sscenc_mode_96k = {eBands_96k, {allocA_96k, allocB_96k}, logN_96k, cache_index_96k,
++                                     cache_bits_96k, cap_96k};
++
++const unsigned char sscenc_log2_frac[24] = {
++    0, 8, 13, 16, 19, 21, 23, 24, 26, 27, 28, 29, 30, 31, 32, 32, 33, 34, 34, 35, 36, 36, 37, 37,
++};
++/* Power-complementary window, w[i] = sin(pi/2 * sin^2(pi*(i+0.5)/216)). */
++const float sscenc_window[SSCE_OVERLAP] = {
++    8.307024837e-05f, 7.475251332e-04f, 2.075871453e-03f, 4.066978116e-03f, 6.719139405e-03f, 1.003006287e-02f,
++    1.399685349e-02f, 1.861599693e-02f, 2.388333622e-02f, 2.979404852e-02f, 3.634261712e-02f, 4.352280218e-02f,
++    5.132761179e-02f, 5.974926753e-02f, 6.877917284e-02f, 7.840787945e-02f, 8.862505620e-02f, 9.941945365e-02f,
++    1.107788784e-01f, 1.226901603e-01f, 1.351391296e-01f, 1.481105927e-01f, 1.615883140e-01f, 1.755550024e-01f,
++    1.899922988e-01f, 2.048807754e-01f, 2.201999347e-01f, 2.359282179e-01f, 2.520430214e-01f, 2.685207147e-01f,
++    2.853366728e-01f, 3.024653099e-01f, 3.198801246e-01f, 3.375537498e-01f, 3.554580142e-01f, 3.735640068e-01f,
++    3.918421515e-01f, 4.102622881e-01f, 4.287937614e-01f, 4.474055134e-01f, 4.660661849e-01f, 4.847442196e-01f,
++    5.034079752e-01f, 5.220258376e-01f, 5.405663364e-01f, 5.589982672e-01f, 5.772908097e-01f, 5.954136522e-01f,
++    6.133371112e-01f, 6.310322522e-01f, 6.484710095e-01f, 6.656262991e-01f, 6.824721326e-01f, 6.989837214e-01f,
++    7.151375790e-01f, 7.309116144e-01f, 7.462852201e-01f, 7.612393512e-01f, 7.757565966e-01f, 7.898212383e-01f,
++    8.034193069e-01f, 8.165386217e-01f, 8.291688231e-01f, 8.413013942e-01f, 8.529296718e-01f, 8.640488475e-01f,
++    8.746559564e-01f, 8.847498582e-01f, 8.943312061e-01f, 9.034024077e-01f, 9.119675732e-01f, 9.200324607e-01f,
++    9.276044052e-01f, 9.346922487e-01f, 9.413062553e-01f, 9.474580232e-01f, 9.531603935e-01f, 9.584273491e-01f,
++    9.632739099e-01f, 9.677160303e-01f, 9.717704854e-01f, 9.754547602e-01f, 9.787869370e-01f, 9.817855805e-01f,
++    9.844696242e-01f, 9.868582557e-01f, 9.889708045e-01f, 9.908266324e-01f, 9.924450233e-01f, 9.938450786e-01f,
++    9.950456130e-01f, 9.960650578e-01f, 9.969213633e-01f, 9.976319089e-01f, 9.982134164e-01f, 9.986818694e-01f,
++    9.990524338e-01f, 9.993393887e-01f, 9.995560590e-01f, 9.997147527e-01f, 9.998267074e-01f, 9.999020393e-01f,
++    9.999496979e-01f, 9.999774261e-01f, 9.999917299e-01f, 9.999978454e-01f, 9.999997206e-01f, 9.999999967e-01f,
++};
++const float sscenc_eMeans[25] = {
++    6.437500f, 6.250000f, 5.750000f, 5.312500f, 5.062500f, 4.812500f, 4.500000f, 4.375000f,
++    4.875000f, 4.687500f, 4.562500f, 4.437500f, 4.875000f, 4.625000f, 4.312500f, 4.500000f,
++    4.375000f, 4.625000f, 4.750000f, 4.437500f, 3.750000f, 3.750000f, 3.750000f, 3.750000f,
++    3.750000f,
++};
++/* Coarse energy Laplace models for 864-sample frames (CELT LM=3): probability of 0, decay. */
++const unsigned char sscenc_e_prob_model[2][42] = {
++    {
++        42, 121, 96, 66, 108, 43, 111, 40, 117, 44, 123, 32, 120, 36,
++        119, 33, 127, 33, 134, 34, 139, 21, 147, 23, 152, 20, 158, 25,
++        154, 26, 166, 21, 173, 16, 184, 13, 184, 10, 150, 13, 139, 15,
++    },
++    {
++        22, 178, 63, 114, 74, 82, 84, 83, 92, 82, 103, 62, 96, 72,
++        96, 67, 101, 73, 107, 72, 113, 55, 118, 52, 125, 52, 118, 52,
++        117, 55, 135, 49, 137, 39, 157, 32, 145, 29, 97, 33, 77, 40,
++    }
++};
++/* U(N,K) table of the PVQ codebook sizes (libopus 1.1 cwrs.c, non-custom build). */
++static const uint32_t pvq_u_data[1272] = {
++    1, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 0, 0, 0, 0, 0, 0, 0,
++    0, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 1, 1, 1, 1, 1, 1, 1,
++    1, 3, 5, 7, 9, 11, 13, 15,
++    17, 19, 21, 23, 25, 27, 29, 31,
++    33, 35, 37, 39, 41, 43, 45, 47,
++    49, 51, 53, 55, 57, 59, 61, 63,
++    65, 67, 69, 71, 73, 75, 77, 79,
++    81, 83, 85, 87, 89, 91, 93, 95,
++    97, 99, 101, 103, 105, 107, 109, 111,
++    113, 115, 117, 119, 121, 123, 125, 127,
++    129, 131, 133, 135, 137, 139, 141, 143,
++    145, 147, 149, 151, 153, 155, 157, 159,
++    161, 163, 165, 167, 169, 171, 173, 175,
++    177, 179, 181, 183, 185, 187, 189, 191,
++    193, 195, 197, 199, 201, 203, 205, 207,
++    209, 211, 213, 215, 217, 219, 221, 223,
++    225, 227, 229, 231, 233, 235, 237, 239,
++    241, 243, 245, 247, 249, 251, 253, 255,
++    257, 259, 261, 263, 265, 267, 269, 271,
++    273, 275, 277, 279, 281, 283, 285, 287,
++    289, 291, 293, 295, 297, 299, 301, 303,
++    305, 307, 309, 311, 313, 315, 317, 319,
++    321, 323, 325, 327, 329, 331, 333, 335,
++    337, 339, 341, 343, 345, 347, 349, 351,
++    13, 25, 41, 61, 85, 113, 145, 181,
++    221, 265, 313, 365, 421, 481, 545, 613,
++    685, 761, 841, 925, 1013, 1105, 1201, 1301,
++    1405, 1513, 1625, 1741, 1861, 1985, 2113, 2245,
++    2381, 2521, 2665, 2813, 2965, 3121, 3281, 3445,
++    3613, 3785, 3961, 4141, 4325, 4513, 4705, 4901,
++    5101, 5305, 5513, 5725, 5941, 6161, 6385, 6613,
++    6845, 7081, 7321, 7565, 7813, 8065, 8321, 8581,
++    8845, 9113, 9385, 9661, 9941, 10225, 10513, 10805,
++    11101, 11401, 11705, 12013, 12325, 12641, 12961, 13285,
++    13613, 13945, 14281, 14621, 14965, 15313, 15665, 16021,
++    16381, 16745, 17113, 17485, 17861, 18241, 18625, 19013,
++    19405, 19801, 20201, 20605, 21013, 21425, 21841, 22261,
++    22685, 23113, 23545, 23981, 24421, 24865, 25313, 25765,
++    26221, 26681, 27145, 27613, 28085, 28561, 29041, 29525,
++    30013, 30505, 31001, 31501, 32005, 32513, 33025, 33541,
++    34061, 34585, 35113, 35645, 36181, 36721, 37265, 37813,
++    38365, 38921, 39481, 40045, 40613, 41185, 41761, 42341,
++    42925, 43513, 44105, 44701, 45301, 45905, 46513, 47125,
++    47741, 48361, 48985, 49613, 50245, 50881, 51521, 52165,
++    52813, 53465, 54121, 54781, 55445, 56113, 56785, 57461,
++    58141, 58825, 59513, 60205, 60901, 61601, 63, 129,
++    231, 377, 575, 833, 1159, 1561, 2047, 2625,
++    3303, 4089, 4991, 6017, 7175, 8473, 9919, 11521,
++    13287, 15225, 17343, 19649, 22151, 24857, 27775, 30913,
++    34279, 37881, 41727, 45825, 50183, 54809, 59711, 64897,
++    70375, 76153, 82239, 88641, 95367, 102425, 109823, 117569,
++    125671, 134137, 142975, 152193, 161799, 171801, 182207, 193025,
++    204263, 215929, 228031, 240577, 253575, 267033, 280959, 295361,
++    310247, 325625, 341503, 357889, 374791, 392217, 410175, 428673,
++    447719, 467321, 487487, 508225, 529543, 551449, 573951, 597057,
++    620775, 645113, 670079, 695681, 721927, 748825, 776383, 804609,
++    833511, 863097, 893375, 924353, 956039, 988441, 1021567, 1055425,
++    1090023, 1125369, 1161471, 1198337, 1235975, 1274393, 1313599, 1353601,
++    1394407, 1436025, 1478463, 1521729, 1565831, 1610777, 1656575, 1703233,
++    1750759, 1799161, 1848447, 1898625, 1949703, 2001689, 2054591, 2108417,
++    2163175, 2218873, 2275519, 2333121, 2391687, 2451225, 2511743, 2573249,
++    2635751, 2699257, 2763775, 2829313, 2895879, 2963481, 3032127, 3101825,
++    3172583, 3244409, 3317311, 3391297, 3466375, 3542553, 3619839, 3698241,
++    3777767, 3858425, 3940223, 4023169, 4107271, 4192537, 4278975, 4366593,
++    4455399, 4545401, 4636607, 4729025, 4822663, 4917529, 5013631, 5110977,
++    5209575, 5309433, 5410559, 5512961, 5616647, 5721625, 5827903, 5935489,
++    6044391, 6154617, 6266175, 6379073, 6493319, 6608921, 6725887, 6844225,
++    6963943, 7085049, 7207551, 321, 681, 1289, 2241, 3649,
++    5641, 8361, 11969, 16641, 22569, 29961, 39041, 50049,
++    63241, 78889, 97281, 118721, 143529, 172041, 204609, 241601,
++    283401, 330409, 383041, 441729, 506921, 579081, 658689, 746241,
++    842249, 947241, 1061761, 1186369, 1321641, 1468169, 1626561, 1797441,
++    1981449, 2179241, 2391489, 2618881, 2862121, 3121929, 3399041, 3694209,
++    4008201, 4341801, 4695809, 5071041, 5468329, 5888521, 6332481, 6801089,
++    7295241, 7815849, 8363841, 8940161, 9545769, 10181641, 10848769, 11548161,
++    12280841, 13047849, 13850241, 14689089, 15565481, 16480521, 17435329, 18431041,
++    19468809, 20549801, 21675201, 22846209, 24064041, 25329929, 26645121, 28010881,
++    29428489, 30899241, 32424449, 34005441, 35643561, 37340169, 39096641, 40914369,
++    42794761, 44739241, 46749249, 48826241, 50971689, 53187081, 55473921, 57833729,
++    60268041, 62778409, 65366401, 68033601, 70781609, 73612041, 76526529, 79526721,
++    82614281, 85790889, 89058241, 92418049, 95872041, 99421961, 103069569, 106816641,
++    110664969, 114616361, 118672641, 122835649, 127107241, 131489289, 135983681, 140592321,
++    145317129, 150160041, 155123009, 160208001, 165417001, 170752009, 176215041, 181808129,
++    187533321, 193392681, 199388289, 205522241, 211796649, 218213641, 224775361, 231483969,
++    238341641, 245350569, 252512961, 259831041, 267307049, 274943241, 282741889, 290705281,
++    298835721, 307135529, 315607041, 324252609, 333074601, 342075401, 351257409, 360623041,
++    370174729, 379914921, 389846081, 399970689, 410291241, 420810249, 431530241, 442453761,
++    453583369, 464921641, 476471169, 488234561, 500214441, 512413449, 524834241, 537479489,
++    550351881, 563454121, 576788929, 590359041, 604167209, 618216201, 632508801, 1683,
++    3653, 7183, 13073, 22363, 36365, 56695, 85305, 124515,
++    177045, 246047, 335137, 448427, 590557, 766727, 982729, 1244979,
++    1560549, 1937199, 2383409, 2908411, 3522221, 4235671, 5060441, 6009091,
++    7095093, 8332863, 9737793, 11326283, 13115773, 15124775, 17372905, 19880915,
++    22670725, 25765455, 29189457, 32968347, 37129037, 41699767, 46710137, 52191139,
++    58175189, 64696159, 71789409, 79491819, 87841821, 96879431, 106646281, 117185651,
++    128542501, 140763503, 153897073, 167993403, 183104493, 199284183, 216588185, 235074115,
++    254801525, 275831935, 298228865, 322057867, 347386557, 374284647, 402823977, 433078547,
++    465124549, 499040399, 534906769, 572806619, 612825229, 655050231, 699571641, 746481891,
++    795875861, 847850911, 902506913, 959946283, 1020274013, 1083597703, 1150027593, 1219676595,
++    1292660325, 1369097135, 1449108145, 1532817275, 1620351277, 1711839767, 1807415257, 1907213187,
++    2011371957, 2120032959, 8989, 19825, 40081, 75517, 134245, 227305,
++    369305, 579125, 880685, 1303777, 1884961, 2668525, 3707509, 5064793,
++    6814249, 9041957, 11847485, 15345233, 19665841, 24957661, 31388293, 39146185,
++    48442297, 59511829, 72616013, 88043969, 106114625, 127178701, 151620757, 179861305,
++    212358985, 249612805, 292164445, 340600625, 395555537, 457713341, 527810725, 606639529,
++    695049433, 793950709, 904317037, 1027188385, 1163673953, 1314955181, 1482288821, 1667010073,
++    1870535785, 2094367717, 48639, 108545, 224143, 433905, 795455, 1392065,
++    2340495, 3800305, 5984767, 9173505, 13726991, 20103025, 28875327, 40754369,
++    56610575, 77500017, 104692735, 139703809, 184327311, 240673265, 311207743, 398796225,
++    506750351, 638878193, 799538175, 993696769, 1226990095, 1505789553, 1837271615, 2229491905U,
++    265729, 598417, 1256465, 2485825, 4673345, 8405905, 14546705, 24331777,
++    39490049, 62390545, 96220561, 145198913, 214828609, 312193553, 446304145, 628496897,
++    872893441, 1196924561, 1621925137, 2173806145U, 1462563, 3317445, 7059735, 14218905,
++    27298155, 50250765, 89129247, 152951073, 254831667, 413442773, 654862247, 1014889769,
++    1541911931, 2300409629U, 3375210671U, 8097453, 18474633, 39753273, 81270333, 158819253,
++    298199265, 540279585, 948062325, 1616336765, 45046719, 103274625, 224298231, 464387817,
++    921406335, 1759885185, 3248227095U, 251595969, 579168825, 1267854873, 2653649025U, 1409933619,
++};
++const uint32_t *const sscenc_pvq_u_row[15] = {
++    pvq_u_data + 0,    pvq_u_data + 176,  pvq_u_data + 351,  pvq_u_data + 525,  pvq_u_data + 698,
++    pvq_u_data + 870,  pvq_u_data + 1041, pvq_u_data + 1131, pvq_u_data + 1178, pvq_u_data + 1207,
++    pvq_u_data + 1226, pvq_u_data + 1240, pvq_u_data + 1248, pvq_u_data + 1254, pvq_u_data + 1257};
+diff --git a/spa/plugins/bluez5/ssc-encoder/src/ssc_encoder.c b/spa/plugins/bluez5/ssc-encoder/src/ssc_encoder.c
+new file mode 100644
+index 0000000..61a125e
+--- /dev/null
++++ b/spa/plugins/bluez5/ssc-encoder/src/ssc_encoder.c
+@@ -0,0 +1,691 @@
++/* SSC encoder: frame header, rate table and the per-frame encode flow.
++ *
++ * Copyright (c) 2026 WillyBilly06. BSD-3-Clause, see LICENSE.
++ * The frame flow follows libopus 1.1 celt_encode_with_ec (Copyright 2007-2010 Xiph.Org Foundation,
++ * 2008 Gregory Maxwell, 2007-2008 CSIRO, BSD-3-Clause, see LICENSE), with the SSC bitstream rules:
++ *
++ *   - frame = 4-byte header + range-coded payload; LM = 3 (864 samples, 8 short blocks of 108), 22 bands,
++ *     always two coded channels, start band 0, no pre-emphasis;
++ *   - total_bits = 8 * min(payload, 1275) for every budget check except TF, which uses the full payload;
++ *   - the pitch postfilter has no tapset symbol (tapset 0 only);
++ *   - "hq" rates (E-family, 256k, 328k) code no TF symbols (tf_res = 0);
++ *   - the coded end band comes from the header (22, 21..19 for the E-family, 18 for 152k);
++ *   - dynalloc quanta/caps for C=2, LM=3, then the bands 18..21 boost propagation;
++ *   - allocation vector table selected by bitrate > 192000;
++ *   - bands at or above the end band are reset to -28 after the frame.
++ *
++ * Sample scale: the codec works in 16-bit PCM units. 24-bit input is divided by 256. */
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "ssc_encoder.h"
++#include "ssc_enc_internal.h"
++
++#define FRAME   SSCE_N
++#define INLEN   (SSCE_N + SSCE_OVERLAP)
++#define NEG28   ((int16_t)(-28 * (1 << SSCE_DB_SHIFT)))
++
++static const unsigned char spread_icdf[4] = {25, 23, 2, 0};
++static const unsigned char trim_icdf[11] = {126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0};
++
++/* ---- rate table ---- */
++typedef struct {
++    int bps;
++    unsigned char code; /* header byte 3 (low 5 bits identify the rate) */
++    unsigned char hq;
++    unsigned char efam; /* E-family: 8-bit sequence, end-band side information */
++} rate_info;
++
++static const rate_info rates[14] = {
++    {88000, 0xF0, 0, 0},  {96000, 0xF1, 0, 0},  {128000, 0xF2, 0, 0}, {192000, 0xF3, 0, 0},
++    {229000, 0xF4, 0, 0}, {328000, 0xF5, 1, 0}, {256000, 0xF6, 1, 0}, {291000, 0xE0, 1, 1},
++    {308000, 0xE1, 1, 1}, {442000, 0xE2, 1, 1}, {584000, 0xE3, 1, 1}, {886000, 0xE4, 1, 1},
++    {250000, 0xE5, 1, 1}, {152000, 0xE6, 1, 1},
++};
++
++static const rate_info *find_rate(int bitrate) {
++    int i;
++    for (i = 0; i < 14; i++)
++        if (rates[i].bps == bitrate || (bitrate < 256 && rates[i].code == bitrate)) return &rates[i];
++    return NULL;
++}
++
++int ssc_encoder_bitrate(int bitrate_or_code) {
++    const rate_info *r = find_rate(bitrate_or_code);
++    return r ? r->bps : 0;
++}
++
++/* Range-coded payload size: base = bitrate*864/(Fs*8), +3/128 for non-hq rates, forced odd, payload = base-1.
++ * Fs is 44100 for the 44.1/48 kHz mode. */
++static int payload_bytes(int is96k, const rate_info *r) {
++    int fs = is96k ? 96000 : 44100;
++    int base = (int)(((int64_t)r->bps * FRAME) / ((int64_t)fs * 8));
++    if (!r->hq) base += base * 3 >> 7;
++    base |= 1;
++    return base - 1;
++}
++
++int ssc_encoder_frame_bytes(int sample_rate, int bitrate) {
++    const rate_info *r = find_rate(bitrate);
++    if (!r || (sample_rate != 44100 && sample_rate != 48000 && sample_rate != 96000)) return 0;
++    return payload_bytes(sample_rate == 96000, r) + 4;
++}
++
++/* ---- state ---- */
++typedef struct {
++    float in[SSCE_C][INLEN];       /* [108 history | 864 new] per channel */
++    float freq[SSCE_C * FRAME];    /* MDCT, channel-major */
++    float X[SSCE_C * FRAME];       /* normalised spectrum */
++    float bandE[SSCE_C * SSCE_NB];
++    float bandLogE[SSCE_C * SSCE_NB], bandLogE2[SSCE_C * SSCE_NB];
++    float pre[SSCE_C][SSCE_PF_MAXPERIOD + FRAME]; /* unfiltered input with pitch history */
++    float pitch_buf[(SSCE_PF_MAXPERIOD + FRAME) / 2];
++} work_t;
++
++struct ssc_encoder {
++    int sample_rate, is96k;
++    const sscenc_mode *mode;
++    sscenc_mdct *mdct;
++    work_t *w;
++    float in_mem[SSCE_C][SSCE_OVERLAP];             /* prefiltered input history */
++    float prefilter_mem[SSCE_C][SSCE_PF_MAXPERIOD]; /* unfiltered input history */
++    int prefilter_period;
++    float prefilter_gain;
++    float overlap_max;
++    int16_t oldBandE[SSCE_C * SSCE_NB];
++    int seq;
++    int spread_decision, tonal_average;
++    int consec_transient;
++    int lastCodedBands;
++    float stereo_saving;
++    int have_info;
++    ssc_encoder_frame_info info;
++    ssc_enc_alloc_fn alloc;
++    ssc_enc_free_fn release;
++    void *alloc_ctx;
++};
++
++int ssc_encoder_size(void) { return (int)(sizeof(ssc_encoder) + sizeof(sscenc_mdct) + sizeof(work_t)); }
++
++void ssc_encoder_reset(ssc_encoder *st) {
++    int i;
++    if (!st) return;
++    memset(st->in_mem, 0, sizeof st->in_mem);
++    memset(st->prefilter_mem, 0, sizeof st->prefilter_mem);
++    st->prefilter_period = SSCE_PF_MINPERIOD;
++    st->prefilter_gain = 0;
++    st->overlap_max = 0;
++    for (i = 0; i < SSCE_C * SSCE_NB; i++) st->oldBandE[i] = 0;
++    st->seq = 0;
++    st->spread_decision = SSCE_SPREAD_NORMAL;
++    st->tonal_average = 256;
++    st->consec_transient = 0;
++    st->lastCodedBands = 0;
++    st->stereo_saving = 0;
++    st->have_info = 0;
++}
++
++static void *default_alloc(void *ctx, unsigned size) {
++    (void)ctx;
++    return malloc(size);
++}
++
++static void default_free(void *ctx, void *p) {
++    (void)ctx;
++    free(p);
++}
++
++void ssc_encoder_destroy(ssc_encoder *st) {
++    if (!st) return;
++    if (st->w) st->release(st->alloc_ctx, st->w);
++    if (st->mdct) st->release(st->alloc_ctx, st->mdct);
++    st->release(st->alloc_ctx, st);
++}
++
++ssc_encoder *ssc_encoder_create_with_allocator(int sample_rate, ssc_enc_alloc_fn alloc, ssc_enc_free_fn release,
++                                               void *ctx) {
++    ssc_encoder *st;
++    if (sample_rate != 44100 && sample_rate != 48000 && sample_rate != 96000) return NULL;
++    if (!alloc || !release) return NULL;
++    st = (ssc_encoder *)alloc(ctx, sizeof(ssc_encoder));
++    if (!st) return NULL;
++    memset(st, 0, sizeof *st);
++    st->alloc = alloc;
++    st->release = release;
++    st->alloc_ctx = ctx;
++    st->mdct = (sscenc_mdct *)alloc(ctx, sizeof(sscenc_mdct));
++    st->w = (work_t *)alloc(ctx, sizeof(work_t));
++    if (!st->mdct || !st->w) {
++        ssc_encoder_destroy(st);
++        return NULL;
++    }
++    st->sample_rate = sample_rate;
++    st->is96k = sample_rate == 96000;
++    st->mode = st->is96k ? &sscenc_mode_96k : &sscenc_mode_44k;
++    sscenc_mdct_init(st->mdct);
++    ssc_encoder_reset(st);
++    return st;
++}
++
++ssc_encoder *ssc_encoder_create(int sample_rate) {
++    return ssc_encoder_create_with_allocator(sample_rate, default_alloc, default_free, NULL);
++}
++
++int ssc_encoder_last_frame_info(const ssc_encoder *st, ssc_encoder_frame_info *info) {
++    if (!st || !info || !st->have_info) return -1;
++    *info = st->info;
++    return 0;
++}
++
++/* ---- analysis helpers ---- */
++static void compute_mdcts(ssc_encoder *st, int shortBlocks) {
++    int c;
++    for (c = 0; c < SSCE_C; c++) sscenc_mdct_frame(st->mdct, st->w->in[c], shortBlocks, st->w->freq + c * FRAME);
++}
++
++/* High-frequency spectral shaping ("headroom"): a fixed gain per MDCT bin, at most -1.7 dB and only above
++ * ~6-16 kHz depending on the rate class. Samsung's encoder applies it to every frame; this encoder does the same
++ * by default (SSC_ENC_FLAG_FLAT_RESPONSE turns it off). Values are Q15. */
++static const short headroom_tab[240] = {
++    31308, 31235, 31162, 31089, 31016, 30943, 30870, 30797, 30744, 30691, 30638, 30585, 30532, 30479, 30426,
++    30373, 30320, 30267, 30234, 30201, 30168, 30135, 30102, 30069, 30036, 30003, 29970, 29937, 29904, 29871,
++    29838, 29805, 29786, 29767, 29748, 29729, 29710, 29691, 29672, 29653, 29634, 29615, 29596, 29577, 29558,
++    29539, 29520, 29501, 29482, 29469, 29456, 29443, 29430, 29419, 29412, 29405, 29398, 29391, 29384, 29377,
++    29370, 29363, 29356, 29349, 29342, 29335, 29328, 29321, 29314, 29307, 29300, 29293, 29286, 29279, 29272,
++    29265, 29258, 29251, 29244, 29237, 29230, 29223, 29216, 29209, 29202, 29195, 29188, 29181, 29174, 29167,
++    29160, 29153, 29146, 29139, 29132, 29125, 29110, 29095, 29081, 29066, 29051, 29036, 29021, 29007, 28992,
++    28977, 28962, 28947, 28933, 28918, 28903, 28888, 28873, 28859, 28844, 28829, 28814, 28799, 28785, 28770,
++    28755, 28740, 28725, 28711, 28696, 28681, 28666, 28651, 28637, 28622, 28607, 28592, 28577, 28563, 28548,
++    28533, 28518, 28503, 28489, 28474, 28459, 28444, 28429, 28415, 28400, 28385, 28370, 28355, 28341, 28326,
++    28311, 28296, 28281, 28267, 28252, 28237, 28222, 28207, 28193, 28178, 28163, 28148, 28133, 28119, 28104,
++    28089, 28074, 28059, 28045, 28030, 28015, 28000, 27985, 27971, 27956, 27941, 27926, 27911, 27897, 27882,
++    27867, 27852, 27837, 27823, 27808, 27793, 27778, 27763, 27749, 27734, 27719, 27704, 27689, 27675, 27660,
++    27645, 27630, 27615, 27601, 27586, 27571, 27556, 27541, 27527, 27512, 27497, 27482, 27467, 27453, 27438,
++    27423, 27408, 27393, 27379, 27364, 27349, 27334, 27319, 27305, 27290, 27275, 27260, 27245, 27231, 27216,
++    27201, 27186, 27171, 27157, 27142, 27127, 27112, 27097, 27083, 27068, 27053, 27038, 27023, 27009, 26990,
++};
++
++static float headroom_gain(const sscenc_mode *mode, int is96k, int bitrate, int hq, int j) {
++    const short *eb = mode->eBands;
++    int q = 32768;
++    if (!hq) {
++        if (bitrate >= 96000) {
++            int b0 = eb[20] * 8, lo = b0 + 68, hi = eb[22] * 8;
++            if (j >= lo && j < hi && j - b0 < 240) q = headroom_tab[j - b0];
++        } else {
++            int i0 = eb[17] * 8, i1 = eb[20] * 8 - 15, i2 = eb[22] * 8;
++            if (j >= i0 && j < i1) q = 32767 - 3 * (j - i0);
++            else if (j >= i1 && j < i2) q = 0x7767 - 3 * (i1 - i0) - 5 * (j - i1);
++        }
++    } else if (!is96k) {
++        if (bitrate < 270000) {
++            if (j >= 350 && j < 384) q = 30620;
++            else if (j >= 384 && j < 409) q = 28893;
++            else if (j >= 409) q = 30620;
++        } else {
++            if (j >= 354 && j < 384) q = 30720;
++            else if (j >= 384 && j < 400) q = 28988;
++            else if (j >= 400 && j < 409) q = 28893;
++            else if (j >= 409) q = 30620;
++        }
++    } else {
++        if (bitrate < 270000) {
++            if (j >= 288 && j < 313) q = 30920;
++            else if (j >= 313 && j < 350) q = 30750;
++            else if (j >= 350) q = 30620;
++        } else {
++            if (j >= 288 && j < 313) q = 30920;
++            else if (j >= 313 && j < 354) q = 30820;
++            else if (j >= 354 && j < 400) q = 30720;
++            else if (j >= 400) q = 30620;
++        }
++    }
++    return (float)q * (1.f / 32768.f);
++}
++
++static float bin_gain(const ssc_encoder *st, const rate_info *r, int j) {
++    return headroom_gain(st->mode, st->is96k, r->bps, r->hq, j);
++}
++
++/* Spectrum shaping after each MDCT: the headroom gain (unless flat), and for bitrates below 192 kb/s nothing is
++ * coded above eBands[21] (band 21 itself is still coded, empty). Same bin index for long and interleaved short
++ * spectra. */
++static void shape_spectrum(ssc_encoder *st, const rate_info *r, int shortBlocks, int flat) {
++    int c, j, start = st->mode->eBands[21] * 8;
++    if (!flat)
++        for (j = 0; j < FRAME; j++) {
++            float g = bin_gain(st, r, j);
++            if (g != 1.f)
++                for (c = 0; c < SSCE_C; c++) st->w->freq[c * FRAME + j] *= g;
++        }
++    if (r->bps >= 192000 || (shortBlocks && r->hq)) return;
++    for (c = 0; c < SSCE_C; c++)
++        for (j = start; j < FRAME; j++) st->w->freq[c * FRAME + j] = 0.f;
++}
++
++static void compute_band_energies(ssc_encoder *st) {
++    const short *eBands = st->mode->eBands;
++    int c, i, j;
++    for (c = 0; c < SSCE_C; c++)
++        for (i = 0; i < SSCE_NB; i++) {
++            const float *x = st->w->freq + c * FRAME;
++            float sum = 1e-27f, e;
++            for (j = eBands[i] * 8; j < eBands[i + 1] * 8; j++) sum += x[j] * x[j];
++            e = sqrtf(sum);
++            st->w->bandE[c * SSCE_NB + i] = e;
++            e = log2f(e) - sscenc_eMeans[i];
++            st->w->bandLogE[c * SSCE_NB + i] = e < -28.f ? -28.f : e;
++        }
++}
++
++static void normalise_bands(ssc_encoder *st) {
++    const short *eBands = st->mode->eBands;
++    int c, i, j;
++    memset(st->w->X, 0, sizeof st->w->X);
++    for (c = 0; c < SSCE_C; c++)
++        for (i = 0; i < SSCE_NB; i++) {
++            float g = 1.f / (1e-15f + st->w->bandE[c * SSCE_NB + i]);
++            for (j = eBands[i] * 8; j < eBands[i + 1] * 8; j++) st->w->X[c * FRAME + j] = st->w->freq[c * FRAME + j] * g;
++        }
++}
++
++/* L2 norm of bin ranges [prev, parts[k]) of both channels, in the scale of Samsung's fixed-point spectrum
++ * (16-bit PCM unit = 4096), as used for the end-band side information. E[c*n + k]. The spectrum is measured with
++ * the headroom gain applied (done here if the coded spectrum is flat). */
++static void part_energies(const ssc_encoder *st, const rate_info *r, int flat, int start, const short *parts, int n,
++                          float *E) {
++    const float *freq = st->w->freq;
++    int c, k, j;
++    for (c = 0; c < SSCE_C; c++) {
++        int prev = start;
++        for (k = 0; k < n; k++) {
++            float s = 0;
++            for (j = prev; j < parts[k]; j++) {
++                float v = freq[c * FRAME + j] * (flat ? bin_gain(st, r, j) : 1.f);
++                s += v * v;
++            }
++            E[c * n + k] = 4096.f * sqrtf(s) + 1.f;
++            if (parts[k] > prev) prev = parts[k];
++        }
++    }
++}
++
++/* Header side information. Returns `red` (number of uncoded top bands); writes the 2-bit field for byte 2
++ * and the top 3 bits of byte 3. */
++static int end_band_info(ssc_encoder *st, const rate_info *r, int flat, int *b2_field, int *b3_top) {
++    static const short parts_nonhq[4] = {708, 744, 780, 816};
++    static const short parts_e[4][8] = {
++        {738, 756, 774, 792, 810, 828, 846, 864},
++        {594, 612, 630, 648, 666, 684, 702, 720},
++        {450, 468, 486, 504, 522, 540, 558, 576},
++        {306, 324, 342, 360, 378, 396, 414, 432},
++    };
++    float E[16];
++    *b2_field = 0;
++    *b3_top = 0;
++    if (!r->hq) {
++        /* last-band activity of band 21 (side information only, nothing in the payload depends on it) */
++        int lb = 0;
++        part_energies(st, r, flat, st->mode->eBands[21] * 8, parts_nonhq, 4, E);
++        if (E[3] + E[7] >= 30002.f) lb = 3;
++        else if (E[2] + E[6] >= 30002.f) lb = 2;
++        else if (E[1] + E[5] >= 30002.f) lb = 1;
++        *b2_field = lb;
++        return 0;
++    }
++    if (r->code == 0xE6) return 4; /* 152k: 18 bands, nothing signalled */
++    if (r->efam) {
++        int red, k;
++        for (red = 0; red < 4; red++) {
++            part_energies(st, r, flat, st->mode->eBands[21 - red] * 8, parts_e[red], 8, E);
++            for (k = 7; k >= 0; k--)
++                if (E[k] + E[8 + k] > 12001.f) {
++                    *b2_field = red;
++                    *b3_top = k << 5; /* (sub - 1) << 5 with sub = k + 1 */
++                    return red;
++                }
++        }
++        *b2_field = 3;
++        return 3;
++    }
++    return 0; /* 256k, 328k */
++}
++
++/* Pitch prefilter: finds a pitch period and gain, and filters the new input samples in place with the comb
++ * filter x - g*comb(x) (the decoder's postfilter is the inverse IIR). The filter crossfades from the previous
++ * frame's parameters over the first 108 samples. Returns 1 if the postfilter is signalled on. */
++static int run_prefilter(ssc_encoder *st, int enabled, int nbAvail, int *pitch_out, int *qg_out) {
++    work_t *w = st->w;
++    int c, pitch_index = SSCE_PF_MINPERIOD, pf_on, qg = 0;
++    float gain1 = 0, pf_threshold;
++    for (c = 0; c < SSCE_C; c++) {
++        memcpy(w->pre[c], st->prefilter_mem[c], sizeof(float) * SSCE_PF_MAXPERIOD);
++        memcpy(w->pre[c] + SSCE_PF_MAXPERIOD, w->in[c] + SSCE_OVERLAP, sizeof(float) * FRAME);
++    }
++    if (enabled) {
++        sscenc_pitch_downsample(w->pre[0], w->pre[1], w->pitch_buf, SSCE_PF_MAXPERIOD + FRAME);
++        /* the last 1.5 octaves of the range are skipped (false positives from short-term correlation) */
++        sscenc_pitch_search(w->pitch_buf + (SSCE_PF_MAXPERIOD >> 1), w->pitch_buf, FRAME,
++                            SSCE_PF_MAXPERIOD - 3 * SSCE_PF_MINPERIOD, &pitch_index);
++        pitch_index = SSCE_PF_MAXPERIOD - pitch_index;
++        gain1 = sscenc_remove_doubling(w->pitch_buf, SSCE_PF_MAXPERIOD, SSCE_PF_MINPERIOD, FRAME, &pitch_index,
++                                       st->prefilter_period, st->prefilter_gain);
++        if (pitch_index > SSCE_PF_MAXPERIOD - 2) pitch_index = SSCE_PF_MAXPERIOD - 2;
++        gain1 *= .7f;
++    }
++    /* gain threshold, adjusted for continuity and rate */
++    pf_threshold = .2f;
++    if (abs(pitch_index - st->prefilter_period) * 10 > pitch_index) pf_threshold += .2f;
++    if (nbAvail < 25) pf_threshold += .1f;
++    if (nbAvail < 35) pf_threshold += .1f;
++    if (st->prefilter_gain > .4f) pf_threshold -= .1f;
++    if (st->prefilter_gain > .55f) pf_threshold -= .1f;
++    if (pf_threshold < .2f) pf_threshold = .2f;
++    if (gain1 < pf_threshold) {
++        gain1 = 0;
++        pf_on = 0;
++    } else {
++        if (fabsf(gain1 - st->prefilter_gain) < .1f) gain1 = st->prefilter_gain;
++        qg = (int)floorf(.5f + gain1 * 32 / 3) - 1;
++        qg = sscenc_imax(0, sscenc_imin(7, qg));
++        gain1 = .09375f * (qg + 1);
++        pf_on = 1;
++    }
++    if (st->prefilter_period < SSCE_PF_MINPERIOD) st->prefilter_period = SSCE_PF_MINPERIOD;
++    for (c = 0; c < SSCE_C; c++) {
++        sscenc_comb_filter(w->in[c] + SSCE_OVERLAP, w->pre[c] + SSCE_PF_MAXPERIOD, st->prefilter_period, pitch_index,
++                           FRAME, -st->prefilter_gain, -gain1, SSCE_OVERLAP);
++        memcpy(st->prefilter_mem[c], w->pre[c] + FRAME, sizeof(float) * SSCE_PF_MAXPERIOD);
++    }
++    st->prefilter_period = pitch_index;
++    st->prefilter_gain = gain1;
++    *pitch_out = pitch_index;
++    *qg_out = qg;
++    return pf_on;
++}
++
++/* ---- one frame ---- */
++static int encode_frame(ssc_encoder *st, const float *pcm, float scale, int lsb_depth, int bitrate_in,
++                        unsigned flags, uint8_t *out, int max_bytes) {
++    const sscenc_mode *mode = st->mode;
++    const short *eBands = mode->eBands;
++    work_t *w = st->w;
++    const rate_info *r = find_rate(bitrate_in);
++    sscenc_ec enc;
++    int payload, frame_len, nbAvail, total_bits, i, c, end, red, b2_field, b3_top;
++    int silence, isTransient, shortBlocks, transient_got_disabled = 0, tf_chan = 0, tf_select = 0, spread;
++    int tf_res[SSCE_NB], offsets[SSCE_NB], req[SSCE_NB], pulses[SSCE_NB], fine_quant[SSCE_NB],
++        fine_priority[SSCE_NB];
++    int16_t x16[SSCE_C * SSCE_NB], error[SSCE_C * SSCE_NB];
++    int32_t total_bits8, total_boost, tell, bits, balance;
++    int dynalloc_logp, alloc_trim, anti_collapse_rsv, codedBands, intensity, dual_stereo;
++    float tf_estimate = 0, sample_max;
++    int pf_on, pf_pitch, pf_qg;
++    const int flat = (flags & SSC_ENC_FLAG_FLAT_RESPONSE) != 0;
++
++    if (!r) return SSC_ENC_ERR_BITRATE;
++    payload = payload_bytes(st->is96k, r);
++    frame_len = payload + 4;
++    if (max_bytes < frame_len) return SSC_ENC_ERR_BUFFER;
++    nbAvail = payload < 1275 ? payload : 1275;
++    total_bits = 8 * nbAvail;
++
++    /* input: [previous 108 | new 864] */
++    sample_max = st->overlap_max;
++    for (c = 0; c < SSCE_C; c++) {
++        memcpy(w->in[c], st->in_mem[c], sizeof(float) * SSCE_OVERLAP);
++        for (i = 0; i < FRAME; i++) w->in[c][SSCE_OVERLAP + i] = pcm[2 * i + c] * scale;
++    }
++    st->overlap_max = 0;
++    for (c = 0; c < SSCE_C; c++)
++        for (i = 0; i < FRAME; i++) {
++            float a = fabsf(w->in[c][SSCE_OVERLAP + i]);
++            if (i >= FRAME - SSCE_OVERLAP) {
++                if (a > st->overlap_max) st->overlap_max = a;
++            } else if (a > sample_max) {
++                sample_max = a;
++            }
++        }
++    if (st->overlap_max > sample_max) sample_max = st->overlap_max;
++    silence = sample_max == 0.f;
++
++    sscenc_ec_init(&enc, out + 4, (uint32_t)payload);
++
++    /* silence */
++    sscenc_ec_bit_logp(&enc, silence, 15);
++    if (silence) enc.nbits_total += total_bits - sscenc_ec_tell(&enc);
++
++    /* pitch prefilter / postfilter parameters (no tapset symbol in SSC) */
++    pf_on = run_prefilter(st, !silence && nbAvail >= 25 && !(flags & SSC_ENC_FLAG_NO_POSTFILTER), nbAvail, &pf_pitch,
++                          &pf_qg);
++    if (!pf_on) {
++        if (sscenc_ec_tell(&enc) + 16 <= total_bits) sscenc_ec_bit_logp(&enc, 0, 1);
++    } else {
++        int octave, p1 = pf_pitch + 1;
++        sscenc_ec_bit_logp(&enc, 1, 1);
++        octave = sscenc_ilog((uint32_t)p1) - 5;
++        sscenc_ec_uint(&enc, (uint32_t)octave, 6);
++        sscenc_ec_bits(&enc, (uint32_t)(p1 - (16 << octave)), (unsigned)(4 + octave));
++        sscenc_ec_bits(&enc, (uint32_t)pf_qg, 3);
++    }
++
++    /* transient decision and MDCT */
++    isTransient = 0;
++    if (!silence && !(flags & SSC_ENC_FLAG_NO_TRANSIENTS))
++        isTransient = sscenc_transient_analysis(&w->in[0][0], INLEN, &tf_estimate, &tf_chan);
++    if (sscenc_ec_tell(&enc) + 3 > total_bits) {
++        isTransient = 0;
++        transient_got_disabled = 1;
++    }
++    shortBlocks = isTransient ? SSCE_M : 0;
++    compute_mdcts(st, 0);
++    shape_spectrum(st, r, 0, flat);
++    compute_band_energies(st);
++    memcpy(w->bandLogE2, w->bandLogE, sizeof w->bandLogE2);
++    if (!isTransient && !transient_got_disabled && !silence && !(flags & SSC_ENC_FLAG_NO_TRANSIENTS)) {
++        float oldf[SSCE_C * SSCE_NB];
++        for (i = 0; i < SSCE_C * SSCE_NB; i++) oldf[i] = st->oldBandE[i] * (1.f / (1 << SSCE_DB_SHIFT));
++        if (sscenc_patch_transient_decision(w->bandLogE, oldf, SSCE_NB)) {
++            isTransient = 1;
++            tf_estimate = .2f;
++        }
++    }
++    if (isTransient) {
++        /* bandLogE2 keeps the long-block energies (+1.5 for the short/long scale) for dynalloc */
++        for (i = 0; i < SSCE_C * SSCE_NB; i++) w->bandLogE2[i] += .5f * SSCE_LM;
++        shortBlocks = SSCE_M;
++        compute_mdcts(st, shortBlocks);
++        shape_spectrum(st, r, shortBlocks, flat);
++        compute_band_energies(st);
++    }
++    if (sscenc_ec_tell(&enc) + 3 <= total_bits) sscenc_ec_bit_logp(&enc, isTransient, 3);
++
++    /* header */
++    red = end_band_info(st, r, flat, &b2_field, &b3_top);
++    end = SSCE_NB - red;
++    out[0] = 0xFF;
++    out[1] = r->efam ? (uint8_t)(0xE0 | ((st->seq >> 4) & 0xF)) : 0xEE;
++    out[2] = (uint8_t)(((st->seq & 0xF) << 4) | (b2_field << 2) | 1);
++    /* E-family (except 152k): the top 3 bits of byte 3 carry sub-1 of the last active part (0 if none) */
++    out[3] = (uint8_t)((r->efam && r->code != 0xE6) ? (r->code & 0x1F) | b3_top : r->code);
++
++    normalise_bands(st);
++
++    /* TF resolution (not coded for hq rates) */
++    for (i = 0; i < SSCE_NB; i++) tf_res[i] = isTransient;
++    if (!r->hq && nbAvail >= 15 * SSCE_C) {
++        int lambda = nbAvail < 40 ? 12 : nbAvail < 60 ? 6 : nbAvail < 100 ? 4 : 3;
++        tf_select = sscenc_tf_analysis(mode, SSCE_NB, isTransient, tf_res, 2 * lambda, w->X, tf_estimate, tf_chan);
++    }
++
++    /* coarse energy */
++    for (i = 0; i < SSCE_C * SSCE_NB; i++) {
++        float v = w->bandLogE[i] * (1 << SSCE_DB_SHIFT);
++        x16[i] = (int16_t)floorf(v + .5f);
++    }
++    sscenc_quant_coarse_energy(end, x16, st->oldBandE, total_bits, nbAvail, error, &enc);
++
++    /* TF symbols: budget is the full payload */
++    if (!r->hq) {
++        uint32_t budget = enc.storage * 8, t = (uint32_t)sscenc_ec_tell(&enc);
++        int logp = isTransient ? 2 : 4, curr = 0, tf_changed = 0;
++        int tf_select_rsv = t + logp + 1 <= budget;
++        budget -= tf_select_rsv;
++        for (i = 0; i < SSCE_NB; i++) {
++            if (t + logp <= budget) {
++                sscenc_ec_bit_logp(&enc, tf_res[i] ^ curr, (unsigned)logp);
++                t = (uint32_t)sscenc_ec_tell(&enc);
++                curr = tf_res[i];
++                tf_changed |= curr;
++            } else {
++                tf_res[i] = curr;
++            }
++            logp = isTransient ? 4 : 5;
++        }
++        if (tf_select_rsv && sscenc_tf_select_table[4 * isTransient + 0 + tf_changed] !=
++                                 sscenc_tf_select_table[4 * isTransient + 2 + tf_changed])
++            sscenc_ec_bit_logp(&enc, tf_select, 1);
++        else
++            tf_select = 0;
++        for (i = 0; i < SSCE_NB; i++) tf_res[i] = sscenc_tf_select_table[4 * isTransient + 2 * tf_select + tf_res[i]];
++    } else {
++        for (i = 0; i < SSCE_NB; i++) tf_res[i] = 0;
++    }
++
++    /* spreading */
++    spread = SSCE_SPREAD_NORMAL;
++    if (sscenc_ec_tell(&enc) + 4 <= total_bits) {
++        if (!shortBlocks && nbAvail >= 10 * SSCE_C)
++            st->spread_decision = spread =
++                sscenc_spreading_decision(mode, w->X, &st->tonal_average, st->spread_decision, end);
++        else
++            st->spread_decision = spread = SSCE_SPREAD_NORMAL;
++        sscenc_ec_icdf(&enc, spread, spread_icdf, 5);
++    }
++
++    /* dynamic allocation */
++    sscenc_dynalloc_analysis(mode, w->bandLogE, w->bandLogE2, end, req, lsb_depth, isTransient, nbAvail);
++    dynalloc_logp = 6;
++    total_bits8 = total_bits << SSCE_BITRES;
++    total_boost = 0;
++    tell = (int32_t)sscenc_ec_tell_frac(&enc);
++    for (i = 0; i < SSCE_NB; i++) offsets[i] = 0;
++    for (i = 0; i < end; i++) {
++        int quanta = sscenc_imax(48, (eBands[i + 1] - eBands[i]) << 4), loop_logp = dynalloc_logp, boost = 0, j;
++        for (j = 0; tell + (loop_logp << SSCE_BITRES) < total_bits8 - total_boost && boost < mode->cap[i]; j++) {
++            int flag = j < req[i];
++            sscenc_ec_bit_logp(&enc, flag, (unsigned)loop_logp);
++            tell = (int32_t)sscenc_ec_tell_frac(&enc);
++            if (!flag) break;
++            boost += quanta;
++            total_boost += quanta;
++            loop_logp = 1;
++        }
++        if (boost > 0) dynalloc_logp = sscenc_imax(2, dynalloc_logp - 1);
++        offsets[i] = boost;
++    }
++    /* SSC rule: a large boost in band 18/19/20 also applies to the next band, depending on channel 0's
++     * coarse energies (applied identically by the decoder, nothing is coded). */
++    {
++        const int16_t *E = st->oldBandE;
++        if (offsets[18] > 1000 && offsets[19] == 0) {
++            if (E[19] > 7000 || (E[18] >> 1) < E[19]) offsets[19] = offsets[18];
++        } else if (offsets[19] > 1000 && offsets[20] == 0) {
++            if (E[20] > 7000 || (E[19] >> 1) < E[20]) offsets[20] = offsets[19];
++        } else if (offsets[20] > 1000 && offsets[21] == 0) {
++            if (E[21] > 7000 || (E[20] >> 1) < E[21]) offsets[21] = offsets[20];
++        }
++    }
++
++    /* stereo decisions: mid/side for every band (no intensity), dual stereo from an L1 estimate */
++    dual_stereo = sscenc_stereo_analysis(mode, w->X);
++    intensity = end;
++
++    /* allocation trim */
++    alloc_trim = 5;
++    if (tell + (6 << SSCE_BITRES) <= total_bits8 - total_boost) {
++        alloc_trim = sscenc_alloc_trim_analysis(mode, w->X, w->bandLogE, end, &st->stereo_saving, tf_estimate,
++                                                intensity);
++        sscenc_ec_icdf(&enc, alloc_trim, trim_icdf, 7);
++    }
++
++    /* bit allocation */
++    bits = total_bits8 - (int32_t)sscenc_ec_tell_frac(&enc) - 1;
++    anti_collapse_rsv = (isTransient && bits >= ((SSCE_LM + 2) << SSCE_BITRES)) ? (1 << SSCE_BITRES) : 0;
++    bits -= anti_collapse_rsv;
++    codedBands = sscenc_compute_allocation(mode, end, offsets, alloc_trim, r->bps > 192000, bits, &balance, pulses,
++                                           fine_quant, fine_priority, &intensity, &dual_stereo, st->lastCodedBands,
++                                           end - 1, &enc);
++    if (st->lastCodedBands)
++        st->lastCodedBands = sscenc_imin(st->lastCodedBands + 1, sscenc_imax(st->lastCodedBands - 1, codedBands));
++    else
++        st->lastCodedBands = codedBands;
++
++    sscenc_quant_fine_energy(end, st->oldBandE, error, fine_quant, &enc);
++    sscenc_quant_all_bands(mode, end, w->X, w->X + FRAME, w->bandE, pulses, shortBlocks, spread, dual_stereo,
++                           intensity, tf_res, total_bits8 - anti_collapse_rsv, balance, &enc, codedBands);
++    if (anti_collapse_rsv > 0) sscenc_ec_bits(&enc, st->consec_transient < 2, 1);
++    sscenc_quant_energy_finalise(end, st->oldBandE, error, fine_quant, fine_priority,
++                                 total_bits - sscenc_ec_tell(&enc), &enc);
++
++    /* end-of-frame state, as in the decoder */
++    if (silence)
++        for (i = 0; i < SSCE_C * SSCE_NB; i++) st->oldBandE[i] = NEG28;
++    for (c = 0; c < SSCE_C; c++)
++        for (i = end; i < SSCE_NB; i++) st->oldBandE[c * SSCE_NB + i] = NEG28;
++    if (isTransient || transient_got_disabled) st->consec_transient++;
++    else st->consec_transient = 0;
++
++    st->info.tell_bits = sscenc_ec_tell(&enc);
++    sscenc_ec_done(&enc);
++    if (enc.error) return SSC_ENC_ERR_INTERNAL;
++
++    for (c = 0; c < SSCE_C; c++) memcpy(st->in_mem[c], w->in[c] + FRAME, sizeof(float) * SSCE_OVERLAP);
++
++    st->info.bytes = frame_len;
++    st->info.bitrate = r->bps;
++    st->info.hq = r->hq;
++    st->info.seq = st->seq;
++    st->info.end_band = end;
++    st->info.transient = isTransient;
++    st->info.pf_on = pf_on;
++    st->info.pf_period = pf_on ? pf_pitch : 0;
++    st->info.pf_gain_q = pf_on ? pf_qg : 0;
++    st->info.silence = silence;
++    st->info.coded_bands = codedBands;
++    st->info.total_bits = total_bits;
++    st->have_info = 1;
++    st->seq = (st->seq + 1) & 0xFF;
++    return frame_len;
++}
++
++/* Interleaved float staging buffer for the integer front ends. */
++#define STAGE_SAMPLES (2 * FRAME)
++
++int ssc_encode(ssc_encoder *st, const int16_t *pcm, int bitrate, unsigned flags, uint8_t *out, int max_bytes) {
++    float buf[STAGE_SAMPLES];
++    const rate_info *r = find_rate(bitrate);
++    float scale = 1.f;
++    int i;
++    if (!st || !pcm || !out) return SSC_ENC_ERR_ARG;
++    if (!r) return SSC_ENC_ERR_BITRATE;
++    if ((flags & SSC_ENC_FLAG_SAMSUNG_HQ16_LEVEL) && r->hq) scale = 1.f / 256.f;
++    for (i = 0; i < STAGE_SAMPLES; i++) buf[i] = (float)pcm[i];
++    return encode_frame(st, buf, scale, 16, bitrate, flags, out, max_bytes);
++}
++
++int ssc_encode_s32(ssc_encoder *st, const int32_t *pcm, int bits_per_sample, int bitrate, unsigned flags,
++                   uint8_t *out, int max_bytes) {
++    float buf[STAGE_SAMPLES];
++    int i;
++    if (!st || !pcm || !out || bits_per_sample < 16 || bits_per_sample > 32) return SSC_ENC_ERR_ARG;
++    for (i = 0; i < STAGE_SAMPLES; i++) buf[i] = (float)pcm[i];
++    return encode_frame(st, buf, ldexpf(1.f, 16 - bits_per_sample), bits_per_sample > 24 ? 24 : bits_per_sample,
++                        bitrate, flags, out, max_bytes);
++}
++
++int ssc_encode_float(ssc_encoder *st, const float *pcm, int bitrate, unsigned flags, uint8_t *out, int max_bytes) {
++    if (!st || !pcm || !out) return SSC_ENC_ERR_ARG;
++    return encode_frame(st, pcm, 32768.f, 24, bitrate, flags, out, max_bytes);
++}
