@@ -1,6 +1,6 @@
 # Samsung SSC for PipeWire
 
-Add Samsung Scalable Codec (SSC) support to PipeWire's Bluetooth A2DP source
+Add Samsung Seamless Codec (SSC) support to PipeWire's Bluetooth A2DP source
 path. SSC UHQ is the 24-bit, 96 kHz mode used by compatible Samsung earbuds.
 
 This project builds a small PipeWire BlueZ SPA module and an SSC codec module
