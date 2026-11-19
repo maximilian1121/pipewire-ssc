@@ -96,7 +96,8 @@ From the cloned repository, run:
 
 This removes the user-local modules and the PipeWire/WirePlumber service
 overrides, then restarts both services. It does not remove build files in
-`~/.cache/ssc-pipewire/`.
+`~/.cache/ssc-pipewire/` or the optional Arch build container. To remove that
+container as well, run `distrobox rm ssc-build`.
 
 ## Compatibility
 

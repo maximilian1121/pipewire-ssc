@@ -40,7 +40,7 @@ else
     distrobox create --name ssc-build --image archlinux:latest --yes || fail 'Could not create the Arch build container.'
   fi
 
-  distrobox enter ssc-build -- sudo pacman -Syu --noconfirm \
+  distrobox enter ssc-build -- sudo pacman -Syu --needed --noconfirm \
     gcc meson ninja pkgconf git glib2 glib2-devel dbus bluez-libs sbc || \
     fail 'Could not install the build dependencies inside the Arch container.'
 
