@@ -13,7 +13,7 @@ WirePlumber find the modules, then restarts those services to load them.
 | System | PipeWire | Bluetooth device | Verified result |
 | --- | --- | --- | --- |
 | KDE neon (Ubuntu 24.04 base) | 1.6.0 | Galaxy Buds4 Pro | SSC UHQ, 24-bit, stereo, 96 kHz |
-| Steam Deck (SteamOS) | 1.6.8 | Galaxy Buds4 Pro | SSC UHQ, 24-bit, stereo, 96 kHz |
+| Steam Deck LCD (SteamOS) | 1.6.8 | Galaxy Buds4 Pro | SSC UHQ, 24-bit, stereo, 96 kHz |
 
 On both systems, PipeWire reported `api.bluez5.codec = "ssc"` and the sink
 format `s24-32le 2ch 96000Hz`. KDE neon used WirePlumber 0.5.10 and BlueZ 5.72.
@@ -56,7 +56,7 @@ the user-local installer.
 
 Steam Deck support is experimental. The launcher supports PipeWire 0.3.59 and
 1.6.x. If host build tools are missing, it creates a user-owned Arch Distrobox
-and installs build dependencies inside it. On one Steam Deck running PipeWire
+and installs build dependencies inside it. On one Steam Deck LCD running PipeWire
 1.6.8, the 1.6.0 patch applied, both modules built, and the user service
 overrides installed and restarted successfully. A paired Galaxy Buds4 Pro
 offered the Samsung Seamless Codec profile; after selecting it, PipeWire
@@ -101,7 +101,7 @@ container as well, run `distrobox rm ssc-build`.
 PipeWire's BlueZ codec interface is private and changes between releases, so
 the project carries separate source patches. The 1.6.0 path is confirmed on the
 KDE neon setup listed above, and the same patch built and negotiated SSC with
-Galaxy Buds4 Pro on a Steam Deck running PipeWire 1.6.8. The 0.3.59 patch is
+Galaxy Buds4 Pro on a Steam Deck LCD running PipeWire 1.6.8. The 0.3.59 patch is
 included for older systems but has not been tested on hardware. Other PipeWire
 versions currently stop with a clear unsupported-version error.
 The installer supports systemd user services; other service managers and
