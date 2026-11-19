@@ -4,16 +4,18 @@ set -euo pipefail
 # Build only the two PipeWire SPA modules needed for SSC. This does not build
 # or replace the PipeWire daemon or any distro packages.
 
-PIPEWIRE_VERSION=1.6.0
+INSTALLED_PIPEWIRE_VERSION="$(pipewire --version 2>/dev/null | sed -nE 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
+case "$INSTALLED_PIPEWIRE_VERSION" in
+  0.3.59|1.6.0) PIPEWIRE_VERSION="$INSTALLED_PIPEWIRE_VERSION" ;;
+  *)
+    echo "No SSC patch is available for PipeWire ${INSTALLED_PIPEWIRE_VERSION:-unknown}." >&2
+    echo "Supported source releases: 0.3.59 and 1.6.0." >&2
+    exit 1
+    ;;
+esac
 SYSTEM_SPA_DIR="$(pkg-config --variable=plugindir libspa-0.2 2>/dev/null || true)"
 if [[ -z "$SYSTEM_SPA_DIR" || ! -d "$SYSTEM_SPA_DIR" ]]; then
   echo "Could not find PipeWire's SPA plugin directory (pkg-config libspa-0.2)." >&2
-  exit 1
-fi
-
-if ! pipewire --version 2>/dev/null | grep -Fq "${PIPEWIRE_VERSION}"; then
-  echo "This prototype targets PipeWire ${PIPEWIRE_VERSION}; your installed version differs." >&2
-  echo "A matching patch is needed for other PipeWire versions." >&2
   exit 1
 fi
 
@@ -22,6 +24,7 @@ for tool in git meson ninja pkg-config systemctl; do
 done
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PATCH="$SCRIPT_DIR/pipewire-$PIPEWIRE_VERSION-ssc.patch"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ssc-pipewire"
 SRC_DIR="$CACHE_DIR/pipewire-$PIPEWIRE_VERSION"
 BUILD_DIR="$CACHE_DIR/build-$PIPEWIRE_VERSION"
@@ -44,8 +47,8 @@ if [[ ! -d "$SRC_DIR/.git" ]]; then
     https://gitlab.freedesktop.org/pipewire/pipewire.git "$SRC_DIR"
 fi
 if [[ ! -f "$SRC_DIR/spa/plugins/bluez5/a2dp-codec-ssc.c" ]]; then
-  git -C "$SRC_DIR" apply --check "$SCRIPT_DIR/pipewire-1.6.0-ssc.patch"
-  git -C "$SRC_DIR" apply "$SCRIPT_DIR/pipewire-1.6.0-ssc.patch"
+  git -C "$SRC_DIR" apply --check "$PATCH"
+  git -C "$SRC_DIR" apply "$PATCH"
 elif ! grep -q 'MEDIA_CODEC_FACTORY_LIB("ssc")' "$SRC_DIR/spa/plugins/bluez5/codec-loader.c"; then
   echo "PipeWire source is partially patched; remove $SRC_DIR and retry." >&2
   exit 1

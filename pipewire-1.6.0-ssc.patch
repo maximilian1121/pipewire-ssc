@@ -24,10 +24,10 @@ index 7bf1da5..08c61af 100644
  	{ SPA_BLUETOOTH_AUDIO_CODEC_MSBC, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "msbc", NULL },
 diff --git a/spa/plugins/bluez5/a2dp-codec-ssc.c b/spa/plugins/bluez5/a2dp-codec-ssc.c
 new file mode 100644
-index 0000000..20a741a
+index 0000000..ac210c8
 --- /dev/null
 +++ b/spa/plugins/bluez5/a2dp-codec-ssc.c
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,250 @@
 +/* Samsung Scalable / Seamless Codec A2DP source plugin.
 + * SPDX-License-Identifier: MIT
 + * Encoder implementation: samsung-ssc-encoder, BSD-3-Clause.
@@ -253,7 +253,11 @@ index 0000000..20a741a
 +
 +static const struct media_codec a2dp_codec_ssc = {
 +	.id = SPA_BLUETOOTH_AUDIO_CODEC_SSC,
++#if SPA_VERSION_BLUEZ5_CODEC_MEDIA >= 16
 +	.kind = MEDIA_CODEC_A2DP,
++#else
++	.bap = false,
++#endif
 +	.codec_id = A2DP_CODEC_VENDOR,
 +	.vendor = { .vendor_id = SSC_VENDOR_ID, .codec_id = SSC_CODEC_ID },
 +	.name = "ssc",
@@ -265,7 +269,9 @@ index 0000000..20a741a
 +	.init = codec_init,
 +	.deinit = codec_deinit,
 +	.get_block_size = codec_get_block_size,
++#if SPA_VERSION_BLUEZ5_CODEC_MEDIA >= 9
 +	.get_interval = codec_get_interval,
++#endif
 +	.start_encode = codec_start_encode,
 +	.encode = codec_encode,
 +	.get_delay = codec_get_delay,

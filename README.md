@@ -26,8 +26,8 @@ BSD-3-Clause and CELT/Opus notices.
 
 ## Install
 
-The current installer targets PipeWire 1.6.0 and systemd user services. On
-KDE neon or Ubuntu 24.04, install the build dependencies:
+The installer supports PipeWire 0.3.59 and 1.6.0, and systemd user services.
+On KDE neon or Ubuntu 24.04, install the build dependencies:
 
 ```sh
 sudo apt install build-essential git meson ninja-build pkg-config \
@@ -43,10 +43,10 @@ cd ssc-pipewire
 ./install.sh
 ```
 
-The script builds the modules from the matching PipeWire 1.6.0 source tag,
-stores them under `~/.local/lib/ssc-pipewire/`, and restarts PipeWire and
-WirePlumber. Audio is briefly interrupted. Do not run the installer with
-`sudo`.
+The script detects the installed PipeWire version and builds the modules from
+the matching source tag. It stores them under `~/.local/lib/ssc-pipewire/` and
+restarts PipeWire and WirePlumber. Audio is briefly interrupted. Do not run
+the installer with `sudo`.
 
 Connect your earbuds. SSC should be available as the A2DP profile named
 **Samsung Seamless Codec**. To select it from a terminal, use the card name
@@ -80,10 +80,14 @@ overrides, then restarts both services. It does not remove build files in
 
 ## Compatibility
 
-The codec integration currently targets PipeWire 1.6.0 because its BlueZ codec
-plugin interface is private and versioned. Other PipeWire versions need a
-matching patch. The installer currently supports systemd user services; other
-service managers and distributions still need packaging work.
+PipeWire's BlueZ codec interface is private and changes between releases, so
+the project carries separate source patches. The 1.6.0 path is confirmed on the
+KDE neon setup listed above. The 0.3.59 patch is included for older systems
+such as SteamOS, but has not been tested on a Steam Deck; SteamOS compatibility
+also depends on its installed PipeWire version matching a supported release.
+Other PipeWire versions currently stop with a clear unsupported-version error.
+The installer supports systemd user services; other service managers and
+distributions still need packaging work.
 
 This project adds A2DP playback using SSC. It does not implement Samsung's
 companion-app features, earbud firmware updates, ANC controls, multipoint
