@@ -20,7 +20,7 @@ WirePlumber find the modules, then restarts those services to load them.
 | Negotiated codec | SSC (`api.bluez5.codec = "ssc"`) |
 | Negotiated format | `s24-32le`, stereo, 96 kHz (SSC UHQ) |
 | Steam Deck build/install | SteamOS + PipeWire 1.6.8; user-local module install succeeded |
-| Steam Deck Bluetooth negotiation | Not checked; no SSC-capable headset was connected during installation |
+| Steam Deck Bluetooth negotiation | Galaxy Buds4 Pro, SSC (`api.bluez5.codec = "ssc"`), `s24-32le`, stereo, 96 kHz |
 
 The SSC encoder comes from the public [samsung-ssc-encoder project](https://github.com/WillyBilly06/samsung-ssc-encoder).
 The PipeWire integration patch vendors the encoder sources and preserves their
@@ -62,11 +62,12 @@ Steam Deck support is experimental. The launcher supports PipeWire 0.3.59 and
 1.6.x. If host build tools are missing, it creates a user-owned Arch Distrobox
 and installs build dependencies inside it. On one Steam Deck running PipeWire
 1.6.8, the 1.6.0 patch applied, both modules built, and the user service
-overrides installed and restarted successfully. Bluetooth negotiation still
-needs testing with a paired SSC-capable headset. The launcher does not make the
-SteamOS image writable or install packages on the host. It downloads project
-files into `~/.cache/ssc-pipewire-launch` and leaves the build container and
-cache in place for later runs.
+overrides installed and restarted successfully. A paired Galaxy Buds4 Pro
+offered the Samsung Seamless Codec profile; after selecting it, PipeWire
+reported `api.bluez5.codec = "ssc"` and `s24-32le 2ch 96000Hz`. The launcher
+does not make the SteamOS image writable or install packages on the host. It
+downloads project files into `~/.cache/ssc-pipewire-launch` and leaves the build
+container and cache in place for later runs.
 
 Connect your earbuds. SSC should be available as the A2DP profile named
 **Samsung Seamless Codec**. To select it from a terminal, use the card name
@@ -103,11 +104,10 @@ container as well, run `distrobox rm ssc-build`.
 
 PipeWire's BlueZ codec interface is private and changes between releases, so
 the project carries separate source patches. The 1.6.0 path is confirmed on the
-KDE neon setup listed above, and the same patch built and installed against
-PipeWire 1.6.8 on the tested Steam Deck. SSC negotiation on the Deck remains
-unverified. The 0.3.59 patch is included for older systems but has not been
-tested on hardware. Other PipeWire versions currently stop with a clear
-unsupported-version error.
+KDE neon setup listed above, and the same patch built and negotiated SSC with
+Galaxy Buds4 Pro on a Steam Deck running PipeWire 1.6.8. The 0.3.59 patch is
+included for older systems but has not been tested on hardware. Other PipeWire
+versions currently stop with a clear unsupported-version error.
 The installer supports systemd user services; other service managers and
 distributions still need packaging work.
 
