@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Install Samsung SSC for Steam Deck
+Comment=Build and install Samsung Seamless Codec support for PipeWire
+Icon=audio-headphones
+Terminal=false
+Categories=AudioVideo;Audio;
+Exec=konsole --hold -e /usr/bin/bash -c "script=\"$(dirname \"$1\")/steamdeck-install.sh\"; exec \"$script\"" -- %k

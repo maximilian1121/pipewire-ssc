@@ -48,6 +48,25 @@ the matching source tag. It stores them under `~/.local/lib/ssc-pipewire/` and
 restarts PipeWire and WirePlumber. Audio is briefly interrupted. Do not run
 the installer with `sudo`.
 
+## Steam Deck
+
+In Desktop Mode, download the repository files together (or clone the repo),
+then double-click `Samsung-SSC-Steam-Deck.desktop` and choose **Execute**. Keep
+the `.desktop` file beside `steamdeck-install.sh` and the rest of the repo.
+The launcher opens Konsole, checks SteamOS and PipeWire, then runs the
+user-local installer. It does not make the OS image writable or install system
+packages.
+
+Steam Deck support is still experimental. The launcher currently proceeds only
+when PipeWire reports exactly 0.3.59 and the required build tools and
+development libraries already exist. SteamOS does not normally include a full
+development toolchain, so this may stop with a dependency message. Installing
+packages with `pacman` requires disabling SteamOS read-only mode, and [Valve
+notes that changes made outside Flatpak may be removed by a SteamOS
+update](https://help.steampowered.com/en/faqs/view/671A-4453-E8D2-323C).
+The 0.3.59 codec patch has not yet been tested on physical Deck hardware; this
+launcher does not claim a guaranteed working install.
+
 Connect your earbuds. SSC should be available as the A2DP profile named
 **Samsung Seamless Codec**. To select it from a terminal, use the card name
 shown by `pactl list cards`:
