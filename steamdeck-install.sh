@@ -16,9 +16,12 @@ if ! command -v pipewire >/dev/null 2>&1; then
   fail 'PipeWire was not found. Check that SteamOS Desktop Mode is fully updated.'
 fi
 
-version="$(pipewire --version 2>/dev/null | sed -nE 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
-if [[ "$version" != 0.3.59 ]]; then
-  fail "This repository currently has a SteamOS-era patch for PipeWire 0.3.59, but this Deck reports ${version:-an unknown version}. The codec interface is version-specific; continuing could install an incompatible module."
+version="$(pipewire --version 2>/dev/null | sed -nE 's/.*libpipewire ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
+if [[ -z "$version" ]]; then
+  version="$(pipewire --version 2>/dev/null | sed -nE 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
+fi
+if [[ "$version" != 0.3.59 && ! "$version" =~ ^1\.6\.[0-9]+$ ]]; then
+  fail "This repository supports PipeWire 0.3.59 and the 1.6.x series, but this Deck reports ${version:-an unknown version}. The codec interface is version-specific; continuing could install an incompatible module."
 fi
 
 for tool in git meson ninja pkg-config systemctl; do

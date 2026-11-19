@@ -26,7 +26,7 @@ BSD-3-Clause and CELT/Opus notices.
 
 ## Install
 
-The installer supports PipeWire 0.3.59 and 1.6.0, and systemd user services.
+The installer supports PipeWire 0.3.59 and the 1.6.x series, and systemd user services.
 On KDE neon or Ubuntu 24.04, install the build dependencies:
 
 ```sh
@@ -58,8 +58,10 @@ user-local installer. It does not make the OS image writable or install system
 packages.
 
 Steam Deck support is still experimental. The launcher currently proceeds only
-when PipeWire reports exactly 0.3.59 and the required build tools and
-development libraries already exist. SteamOS does not normally include a full
+when PipeWire reports 0.3.59 or 1.6.x and the required build tools and
+development libraries already exist. The 1.6.x patch was exercised on 1.6.0;
+same-series compatibility on the Deck's 1.6.8 is expected but has not yet been
+verified there. SteamOS does not normally include a full
 development toolchain, so this may stop with a dependency message. Installing
 packages with `pacman` requires disabling SteamOS read-only mode, and [Valve
 notes that changes made outside Flatpak may be removed by a SteamOS

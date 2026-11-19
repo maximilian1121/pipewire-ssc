@@ -6,10 +6,11 @@ set -euo pipefail
 
 INSTALLED_PIPEWIRE_VERSION="$(pipewire --version 2>/dev/null | sed -nE 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
 case "$INSTALLED_PIPEWIRE_VERSION" in
-  0.3.59|1.6.0) PIPEWIRE_VERSION="$INSTALLED_PIPEWIRE_VERSION" ;;
+  0.3.59) PIPEWIRE_VERSION="$INSTALLED_PIPEWIRE_VERSION"; PATCH_VERSION="$PIPEWIRE_VERSION" ;;
+  1.6.[0-9]*) PIPEWIRE_VERSION="$INSTALLED_PIPEWIRE_VERSION"; PATCH_VERSION=1.6.0 ;;
   *)
     echo "No SSC patch is available for PipeWire ${INSTALLED_PIPEWIRE_VERSION:-unknown}." >&2
-    echo "Supported source releases: 0.3.59 and 1.6.0." >&2
+    echo "Supported releases: PipeWire 0.3.59 and the 1.6.x series." >&2
     exit 1
     ;;
 esac
@@ -24,7 +25,7 @@ for tool in git meson ninja pkg-config systemctl; do
 done
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PATCH="$SCRIPT_DIR/pipewire-$PIPEWIRE_VERSION-ssc.patch"
+PATCH="$SCRIPT_DIR/pipewire-$PATCH_VERSION-ssc.patch"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ssc-pipewire"
 SRC_DIR="$CACHE_DIR/pipewire-$PIPEWIRE_VERSION"
 BUILD_DIR="$CACHE_DIR/build-$PIPEWIRE_VERSION"
